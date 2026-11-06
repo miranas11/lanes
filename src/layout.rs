@@ -106,11 +106,11 @@ pub fn visible(off: f64, w: f64, s: f64, usable: f64) -> f64 {
     ((off + w).min(s + usable) - off.max(s)).max(0.0)
 }
 
-/// Where the row should rest so the main stop is framed: fully on screen,
-/// and no neighbour showing only a thin sliver. Keeps `scroll` if it already
-/// frames well (you stop where you stop); otherwise slides by the smallest
-/// amount, lining the main stop or a neighbour up with a screen edge.
-/// `stops` are (offset, width) in row order.
+/// Where the row should rest when scrolling stops. Only when some stop shows
+/// just a thin sliver (less than `sliver` points) does the row slide, by the
+/// smallest amount that lines a stop up with a screen edge and leaves no
+/// sliver. Anything else (half of one app and half of another, say) is a
+/// deliberate position and is kept exactly. `stops` are (offset, width).
 pub fn frame_scroll(
     stops: &[(f64, f64)],
     main: usize,
@@ -123,17 +123,11 @@ pub fn frame_scroll(
     let Some(&(mo, mw)) = stops.get(main) else {
         return scroll.clamp(0.0, max_scroll);
     };
-    // Wider than the screen: show its start.
-    if mw >= usable - 1.0 {
-        return mo.clamp(0.0, max_scroll);
-    }
     let good = |s: f64| {
-        let main_whole = mo >= s - 0.5 && mo + mw <= s + usable + 0.5;
-        main_whole
-            && stops.iter().all(|&(o, w)| {
-                let v = visible(o, w, s, usable);
-                v <= 0.5 || v >= w - 1.0 || v >= sliver
-            })
+        stops.iter().all(|&(o, w)| {
+            let v = visible(o, w, s, usable);
+            v <= 0.5 || v >= w - 1.0 || v >= sliver
+        })
     };
     if good(scroll) {
         return scroll.clamp(0.0, max_scroll);
@@ -282,6 +276,15 @@ mod tests {
     fn a_clean_position_is_kept_exactly() {
         assert_eq!(frame_scroll(&HALVES, 1, 752.0, 1496.0, 300.0), 752.0);
         assert_eq!(frame_scroll(&HALVES, 0, 0.0, 1496.0, 300.0), 0.0);
+    }
+
+    #[test]
+    fn half_of_two_apps_is_left_alone() {
+        let full = [(0.0, 1496.0), (1504.0, 1496.0)];
+        // 746 pt of one and 750 pt of the other: a deliberate position.
+        assert_eq!(frame_scroll(&full, 1, 750.0, 1496.0, 300.0), 750.0);
+        // Halves cut in half are kept too.
+        assert_eq!(frame_scroll(&HALVES, 1, 372.0, 1496.0, 300.0), 372.0);
     }
 
     #[test]
