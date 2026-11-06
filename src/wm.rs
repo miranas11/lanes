@@ -78,6 +78,7 @@ pub enum Cmd {
     PlaceDone,
     PlaceCancel,
     PlaceUngroup,
+    GlideTick,
     Quit,
 }
 
@@ -339,7 +340,11 @@ struct AppEntry {
     observing: bool,
     name: String,
     hidden: bool,
+    /// Apps like Chrome turn on an accessibility mode that animates every
+    /// move (windows slide across the screen). Lanes turns it off around its
+    /// own moves; the flag is re-read every few seconds since apps change it.
     enhanced_ui: bool,
+    enhanced_checked: Instant,
     /// Clicking the desktop activates Finder; never treat that as crossing the wall.
     is_finder: bool,
 }
@@ -433,7 +438,20 @@ struct Wm {
     use_tick: u64,
     /// True while ⌃⌥-scrolling, so windows can slide in before slivers are tidied.
     scrolling: bool,
+    /// A glide of the row in progress (smooth snapping and ⌃⌥←/→).
+    anim: Option<Glide>,
 }
+
+/// The row gliding from one scroll position to another.
+#[derive(Clone, Copy)]
+struct Glide {
+    from: f64,
+    to: f64,
+    start: Instant,
+}
+
+/// How long a glide takes. Short enough to feel instant, long enough to follow.
+const GLIDE_MS: f64 = 180.0;
 
 fn read_screen(mtm: MainThreadMarker) -> Screen {
     let screens = NSScreen::screens(mtm);
@@ -554,6 +572,7 @@ impl Wm {
             used: HashMap::new(),
             use_tick: 0,
             scrolling: false,
+            anim: None,
         }
     }
 
@@ -635,6 +654,7 @@ impl Wm {
                 name,
                 hidden,
                 enhanced_ui,
+                enhanced_checked: Instant::now(),
                 is_finder,
             },
         );
@@ -920,6 +940,7 @@ impl Wm {
             let x = (origin + t.off).round();
             let visible = (x + t.w).min(right) - x.max(left);
             let is_sliver = !self.scrolling
+                && self.anim.is_none()
                 && visible < t.w - 1.0
                 && visible < sliver
                 && !focus.is_some_and(|f| t.has(f));
@@ -955,7 +976,13 @@ impl Wm {
         }
     }
 
-    fn with_enhanced_ui_off(&self, pid: i32, f: impl FnOnce()) {
+    fn with_enhanced_ui_off(&mut self, pid: i32, f: impl FnOnce()) {
+        if let Some(a) = self.apps.get_mut(&pid)
+            && a.enhanced_checked.elapsed() > Duration::from_secs(2)
+        {
+            a.enhanced_ui = ax::names(|n| ax::get_bool(&a.el, &n.enhanced_ui)).unwrap_or(false);
+            a.enhanced_checked = Instant::now();
+        }
         let app = self
             .apps
             .get(&pid)
@@ -1021,9 +1048,15 @@ impl Wm {
         } else {
             scr.park_right
         };
-        ax::set_point(&w.el, CGPoint::new(x, scr.park_y));
-        w.parked = true;
-        w.applied = None;
+        let (el, pid) = (w.el.clone(), w.pid);
+        // Without this, Chrome would visibly slide across the screen to the corner.
+        self.with_enhanced_ui_off(pid, || {
+            ax::set_point(&el, CGPoint::new(x, scr.park_y));
+        });
+        if let Some(w) = self.wins.get_mut(&id) {
+            w.parked = true;
+            w.applied = None;
+        }
     }
 
     fn ensure_visible(&mut self, id: u32) {
@@ -1192,6 +1225,7 @@ impl Wm {
             return;
         }
         if n != self.cur {
+            self.anim = None;
             self.cur = n;
             self.layout();
             self.focus_current_or_self();
@@ -1859,6 +1893,7 @@ impl Wm {
                 | Cmd::MouseDown(..)
                 | Cmd::Scan
                 | Cmd::PlaceHover(_)
+                | Cmd::GlideTick
         ) {
             crate::log!("command: {c:?}");
         }
@@ -2017,6 +2052,8 @@ impl Wm {
                 self.overlay_enter();
             }
             Cmd::Scroll(d) => {
+                // Scrolling takes over from any glide right away.
+                self.anim = None;
                 self.scrolling = true;
                 self.ctxs[self.cur].scroll += d;
                 self.layout_needed = true;
@@ -2058,6 +2095,7 @@ impl Wm {
             Cmd::PlaceDone => self.close_overlay(),
             Cmd::PlaceCancel => self.place_cancel(),
             Cmd::PlaceUngroup => self.place_ungroup(),
+            Cmd::GlideTick => self.glide_tick(),
             Cmd::MouseDown(x, y) => {
                 let inside = matches!(
                     self.overlay,
@@ -2150,20 +2188,69 @@ impl Wm {
         let usable = self.usable();
         let stops: Vec<(f64, f64)> = tiles.iter().map(|t| (t.off, t.w)).collect();
         let sliver = (self.scr.w * 0.2).max(160.0);
-        let ctx = &mut self.ctxs[self.cur];
-        let target = layout::frame_scroll(&stops, main, ctx.scroll, usable, sliver);
-        if (target - ctx.scroll).abs() > 0.5 {
-            ctx.scroll = target;
+        let scroll = self.ctxs[self.cur].scroll;
+        let target = layout::frame_scroll(&stops, main, scroll, usable, sliver);
+        self.glide_to(target);
+        self.layout_needed = true;
+    }
+
+    /// Bring a window into view and frame it (used by ⌃⌥← / ⌃⌥→), gliding.
+    fn frame_window(&mut self, id: u32) {
+        let start = self.ctxs[self.cur].scroll;
+        self.ensure_visible(id);
+        let (tiles, _) = self.tiles(self.cur);
+        if let Some(i) = tiles.iter().position(|t| t.has(id)) {
+            let stops: Vec<(f64, f64)> = tiles.iter().map(|t| (t.off, t.w)).collect();
+            let sliver = (self.scr.w * 0.2).max(160.0);
+            let scroll = self.ctxs[self.cur].scroll;
+            let target = layout::frame_scroll(&stops, i, scroll, self.usable(), sliver);
+            // Glide from where the row was, not from the jump ensure_visible made.
+            self.ctxs[self.cur].scroll = start;
+            self.glide_to(target);
         }
         self.layout_needed = true;
     }
 
-    /// Bring a window into view and frame it (used by ⌃⌥← / ⌃⌥→).
-    fn frame_window(&mut self, id: u32) {
-        self.ensure_visible(id);
-        let (tiles, _) = self.tiles(self.cur);
-        if let Some(i) = tiles.iter().position(|t| t.has(id)) {
-            self.frame(&tiles, i);
+    /// Move the row to `target` smoothly (instantly with Reduce Motion).
+    fn glide_to(&mut self, target: f64) {
+        let from = self.ctxs[self.cur].scroll;
+        if (target - from).abs() < 0.5 {
+            self.anim = None;
+            return;
+        }
+        // Respect Reduce Motion, unless LANES_SMOOTH=1 asks to glide anyway.
+        let reduce = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+            && std::env::var_os("LANES_SMOOTH").is_none_or(|v| v != "1");
+        if reduce {
+            self.anim = None;
+            self.ctxs[self.cur].scroll = target;
+            self.layout_needed = true;
+            return;
+        }
+        let was_gliding = self.anim.is_some();
+        self.anim = Some(Glide {
+            from,
+            to: target,
+            start: Instant::now(),
+        });
+        if !was_gliding {
+            ui::schedule_glide_tick();
+        }
+    }
+
+    /// One frame of a glide: ease out (fast start, gentle landing).
+    fn glide_tick(&mut self) {
+        let Some(g) = self.anim else {
+            return;
+        };
+        let t = (g.start.elapsed().as_secs_f64() * 1000.0 / GLIDE_MS).min(1.0);
+        let eased = 1.0 - (1.0 - t).powi(3);
+        self.ctxs[self.cur].scroll = g.from + (g.to - g.from) * eased;
+        self.layout_needed = true;
+        if t >= 1.0 {
+            self.anim = None;
+        } else {
+            ui::schedule_glide_tick();
         }
     }
 

@@ -161,6 +161,11 @@ define_class!(
             wm::push(Cmd::AppChanged(n.intValue()));
         }
 
+        #[unsafe(method(glideTick:))]
+        fn glide_tick(&self, _o: Option<&AnyObject>) {
+            wm::push(Cmd::GlideTick);
+        }
+
         #[unsafe(method(scrollEnded:))]
         fn scroll_ended(&self, _o: Option<&AnyObject>) {
             wm::push(Cmd::ScrollEnd);
@@ -295,6 +300,11 @@ pub fn schedule_save() {
 
 pub fn schedule_trust_poll() {
     debounce(sel!(trustPoll:), 1.0);
+}
+
+/// Next frame of a glide, about 60 times a second.
+pub fn schedule_glide_tick() {
+    perform(sel!(glideTick:), None, 1.0 / 60.0);
 }
 
 pub fn schedule_scroll_end() {
