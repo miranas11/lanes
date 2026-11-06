@@ -1301,12 +1301,13 @@ pub fn show_area_map(title: &str, taken: &[bool; 9], filling: bool, lit: Option<
     );
 }
 
-/// A rounded accent-coloured ring around a window (frame in AppKit coordinates).
+/// A thin, soft, see-through accent ring around a window (frame in AppKit
+/// coordinates): a quiet hint of where the shortcuts go, not a bright frame.
 pub fn show_outline(x: f64, y: f64, w: f64, h: f64) {
     UI.with_borrow_mut(|u| {
         let Some(u) = u else { return };
         let mtm = u.mtm;
-        let pad = 3.0;
+        let pad = 2.0;
         let frame = rect(x - pad, y - pad, w + 2.0 * pad, h + 2.0 * pad);
         let panel = u
             .outline
@@ -1318,8 +1319,8 @@ pub fn show_outline(x: f64, y: f64, w: f64, h: f64) {
                 let ring = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, 10.0, 10.0));
                 ring.setWantsLayer(true);
                 if let Some(l) = ring.layer() {
-                    l.setBorderWidth(4.0);
-                    l.setCornerRadius(14.0);
+                    l.setBorderWidth(2.0);
+                    l.setCornerRadius(13.0);
                 }
                 p.setContentView(Some(&ring));
                 p
@@ -1327,7 +1328,8 @@ pub fn show_outline(x: f64, y: f64, w: f64, h: f64) {
             .clone();
         // The accent colour can change in System Settings, so set it each time.
         if let Some(l) = panel.contentView().and_then(|v| v.layer()) {
-            l.setBorderColor(Some(&NSColor::controlAccentColor().CGColor()));
+            let soft = NSColor::controlAccentColor().colorWithAlphaComponent(0.45);
+            l.setBorderColor(Some(&soft.CGColor()));
         }
         panel.setFrame_display(frame, true);
         if !panel.isVisible() {
