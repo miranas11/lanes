@@ -100,6 +100,70 @@ pub fn subtract(r: Rect, n: Rect) -> Option<Rect> {
     }
 }
 
+/// How much of a stop at `off`..`off + w` is on screen when the row is
+/// scrolled to `s` and the screen shows `usable` points.
+pub fn visible(off: f64, w: f64, s: f64, usable: f64) -> f64 {
+    ((off + w).min(s + usable) - off.max(s)).max(0.0)
+}
+
+/// Where the row should rest so the main stop is framed: fully on screen,
+/// and no neighbour showing only a thin sliver. Keeps `scroll` if it already
+/// frames well (you stop where you stop); otherwise slides by the smallest
+/// amount, lining the main stop or a neighbour up with a screen edge.
+/// `stops` are (offset, width) in row order.
+pub fn frame_scroll(
+    stops: &[(f64, f64)],
+    main: usize,
+    scroll: f64,
+    usable: f64,
+    sliver: f64,
+) -> f64 {
+    let total = stops.last().map_or(0.0, |(o, w)| o + w);
+    let max_scroll = (total - usable).max(0.0);
+    let Some(&(mo, mw)) = stops.get(main) else {
+        return scroll.clamp(0.0, max_scroll);
+    };
+    // Wider than the screen: show its start.
+    if mw >= usable - 1.0 {
+        return mo.clamp(0.0, max_scroll);
+    }
+    let good = |s: f64| {
+        let main_whole = mo >= s - 0.5 && mo + mw <= s + usable + 0.5;
+        main_whole
+            && stops.iter().all(|&(o, w)| {
+                let v = visible(o, w, s, usable);
+                v <= 0.5 || v >= w - 1.0 || v >= sliver
+            })
+    };
+    if good(scroll) {
+        return scroll.clamp(0.0, max_scroll);
+    }
+    // Candidate resting points: some stop's edge on a screen edge, or the
+    // main stop centred.
+    let mut cands = vec![mo + mw / 2.0 - usable / 2.0];
+    for &(o, w) in stops {
+        cands.push(o);
+        cands.push(o + w - usable);
+    }
+    let mut best: Option<f64> = None;
+    for c in cands {
+        let c = c.clamp(0.0, max_scroll);
+        if good(c) && best.is_none_or(|b| (c - scroll).abs() < (b - scroll).abs()) {
+            best = Some(c);
+        }
+    }
+    // Nothing frames cleanly (odd widths): at least show the main stop whole.
+    best.unwrap_or_else(|| {
+        let left = mo.clamp(0.0, max_scroll);
+        let right = (mo + mw - usable).clamp(0.0, max_scroll);
+        if (left - scroll).abs() <= (right - scroll).abs() {
+            left
+        } else {
+            right
+        }
+    })
+}
+
 /// Does the union of `rects` cover the whole screen? Sampled on a 10 × 10 grid,
 /// which is exact for the halves and quarters Lanes uses.
 pub fn covers_all(rects: &[Rect]) -> bool {
@@ -200,6 +264,31 @@ mod tests {
         assert_eq!(subtract(AREAS[0], AREAS[3]), None);
         // Not touching: unchanged.
         assert_eq!(subtract(AREAS[3], AREAS[5]), Some(AREAS[3]));
+    }
+
+    // Three half-width stops (744 wide, 8 apart) on a 1496-wide screen.
+    const HALVES: [(f64, f64); 3] = [(0.0, 744.0), (752.0, 744.0), (1504.0, 744.0)];
+
+    #[test]
+    fn a_small_scroll_snaps_back_so_the_main_app_is_framed() {
+        // Scrolled 100 right: the first stop is cut, a 100-pt sliver of the third shows.
+        let s = frame_scroll(&HALVES, 1, 100.0, 1496.0, 300.0);
+        // The row slides so the main (second) stop lines up and nothing is cut.
+        assert!(s == 0.0 || s == 752.0, "rested at {s}");
+        assert_eq!(s, 0.0);
+    }
+
+    #[test]
+    fn a_clean_position_is_kept_exactly() {
+        assert_eq!(frame_scroll(&HALVES, 1, 752.0, 1496.0, 300.0), 752.0);
+        assert_eq!(frame_scroll(&HALVES, 0, 0.0, 1496.0, 300.0), 0.0);
+    }
+
+    #[test]
+    fn a_full_width_main_app_is_shown_whole() {
+        let full = [(0.0, 1496.0), (1504.0, 1496.0)];
+        // 250 pt of the first one peeking in: frame the second.
+        assert_eq!(frame_scroll(&full, 1, 1254.0, 1496.0, 300.0), 1504.0);
     }
 
     #[test]

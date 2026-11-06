@@ -1107,7 +1107,7 @@ impl Wm {
         };
         let id = ids[j];
         self.ctxs[self.cur].focus = Some(id);
-        self.ensure_visible(id);
+        self.frame_window(id);
         self.layout();
         self.focus(id);
         self.dots_needed = true;
@@ -2116,31 +2116,54 @@ impl Wm {
     }
 
     /// After a ⌃⌥-scroll ends, keep keyboard focus on a window you can see.
+    /// When you let go after ⌃⌥-scrolling: the most visible app becomes the
+    /// main one, gets focus, and the row slides so it's framed (no slivers).
     fn after_scroll(&mut self) {
         let usable = self.usable();
-        let (tiles, total) = self.tiles(self.cur);
-        if total <= usable {
+        let (tiles, _) = self.tiles(self.cur);
+        if tiles.is_empty() {
             return;
         }
         let scroll = self.ctxs[self.cur].scroll;
-        let visible = |t: &Tile| {
-            let a = (t.off - scroll).max(0.0);
-            let b = (t.off + t.w - scroll).min(usable);
-            ((b - a).max(0.0)) / t.w
-        };
         let focus = self.ctxs[self.cur].focus;
-        if let Some(t) = tiles.iter().find(|t| focus.is_some_and(|f| t.has(f)))
-            && visible(t) >= 0.5
-        {
-            return;
-        }
-        let best = tiles.iter().max_by(|a, b| {
-            visible(a)
-                .partial_cmp(&visible(b))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        if let Some(&(id, _)) = best.and_then(|t| t.ids.first()) {
+        let main = (0..tiles.len())
+            .max_by(|&a, &b| {
+                let key = |i: usize| {
+                    let t = &tiles[i];
+                    (
+                        layout::visible(t.off, t.w, scroll, usable).round() as i64,
+                        focus.is_some_and(|f| t.has(f)),
+                    )
+                };
+                key(a).cmp(&key(b))
+            })
+            .unwrap_or(0);
+        self.frame(&tiles, main);
+        let has_focus = focus.is_some_and(|f| tiles[main].has(f));
+        if !has_focus && let Some(&(id, _)) = tiles[main].ids.first() {
             self.focus(id);
+        }
+    }
+
+    /// Slide the row (never resize) so `tiles[main]` is framed.
+    fn frame(&mut self, tiles: &[Tile], main: usize) {
+        let usable = self.usable();
+        let stops: Vec<(f64, f64)> = tiles.iter().map(|t| (t.off, t.w)).collect();
+        let sliver = (self.scr.w * 0.2).max(160.0);
+        let ctx = &mut self.ctxs[self.cur];
+        let target = layout::frame_scroll(&stops, main, ctx.scroll, usable, sliver);
+        if (target - ctx.scroll).abs() > 0.5 {
+            ctx.scroll = target;
+        }
+        self.layout_needed = true;
+    }
+
+    /// Bring a window into view and frame it (used by ⌃⌥← / ⌃⌥→).
+    fn frame_window(&mut self, id: u32) {
+        self.ensure_visible(id);
+        let (tiles, _) = self.tiles(self.cur);
+        if let Some(i) = tiles.iter().position(|t| t.has(id)) {
+            self.frame(&tiles, i);
         }
     }
 
