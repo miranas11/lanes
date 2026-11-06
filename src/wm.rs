@@ -311,6 +311,11 @@ struct Win {
     applied: Option<Frame>,
     parked: bool,
     present: bool,
+    /// In macOS full screen (its own Space): it keeps its spot in the row,
+    /// but Lanes leaves it alone until it comes back.
+    away: bool,
+    /// When it last left full screen: macOS lists it again only after a moment.
+    back_at: Option<Instant>,
     /// Smallest width the app accepted, learned when it refused a smaller one.
     min_w: f64,
     full_prev: Option<f64>,
@@ -632,6 +637,12 @@ impl Wm {
                 _ => c.order.first().copied(),
             };
         }
+        // No windows at all usually means the Mac is locked (or apps are still
+        // launching): keep the saved layout for the windows that show up later.
+        if self.wins.is_empty() {
+            crate::log!("boot: no windows yet, keeping the saved layout");
+            return;
+        }
         self.saved.clear();
         self.save_needed = true;
     }
@@ -719,14 +730,22 @@ impl Wm {
                     ax::get_bool(&el, &n.fullscreen).unwrap_or(false),
                 )
             });
-            if subrole.as_deref() != Some("AXStandardWindow") || minimized || fullscreen {
+            if subrole.as_deref() != Some("AXStandardWindow") || minimized {
+                continue;
+            }
+            if fullscreen && !self.wins.contains_key(&id) {
                 continue;
             }
             seen.insert(id);
             if let Some(w) = self.wins.get_mut(&id) {
+                let flip = w.away != fullscreen;
                 if !w.present {
                     w.present = true;
                     w.applied = None;
+                    changed = true;
+                }
+                if flip {
+                    self.set_away(id, fullscreen);
                     changed = true;
                 }
                 continue;
@@ -756,6 +775,19 @@ impl Wm {
                 continue;
             };
             if ax::is_alive(&w.el) {
+                // A full-screen window lives on its own Space and can drop out
+                // of the app's window list for a moment: it keeps its spot.
+                let returning = w
+                    .back_at
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(3));
+                if w.away || returning {
+                    continue;
+                }
+                if ax::names(|n| ax::get_bool(&w.el, &n.fullscreen)).unwrap_or(false) {
+                    self.set_away(id, true);
+                    changed = true;
+                    continue;
+                }
                 if w.present {
                     w.present = false;
                     changed = true;
@@ -824,6 +856,8 @@ impl Wm {
                 applied: None,
                 parked: false,
                 present: true,
+                away: false,
+                back_at: None,
                 min_w: 0.0,
                 full_prev: None,
                 touched: Instant::now(),
@@ -969,6 +1003,9 @@ impl Wm {
                 && !focus.is_some_and(|f| t.has(f));
             let off_screen = x + t.w <= left + 1.0 || x >= right - 1.0 || is_sliver;
             for &(id, r) in &t.ids {
+                if self.wins.get(&id).is_some_and(|w| w.away) {
+                    continue;
+                }
                 if off_screen {
                     self.park(id);
                     continue;
@@ -991,7 +1028,7 @@ impl Wm {
         let others: Vec<u32> = self
             .wins
             .values()
-            .filter(|w| w.ctx != cur && w.present && !w.parked)
+            .filter(|w| w.ctx != cur && w.present && !w.parked && !w.away)
             .map(|w| w.id)
             .collect();
         for id in others {
@@ -1195,6 +1232,9 @@ impl Wm {
         let Some(id) = ax::window_id(&el) else { return };
         if !self.wins.contains_key(&id) {
             self.refresh_app(pid);
+        }
+        if self.wins.get(&id).is_some_and(|w| w.away) {
+            self.check_away(id);
         }
         let Some(w) = self.wins.get(&id) else { return };
         if w.ctx == self.cur {
@@ -1866,9 +1906,24 @@ impl Wm {
     /// windows arriving from another desktop. One cheap WindowServer query;
     /// apps are only asked when an unknown window is actually on screen.
     fn scan(&mut self) {
+        // Full-screen windows: did one come back? Also catch one that went
+        // full screen while out of the list. (One AX read each.)
+        let cur = self.cur;
+        let away: Vec<u32> = self
+            .wins
+            .values()
+            .filter(|w| w.away || (!w.present && w.ctx == cur))
+            .map(|w| w.id)
+            .collect();
+        for id in away {
+            self.check_away(id);
+        }
         let mut pids = Vec::new();
         for (id, pid) in crate::spaces::onscreen_windows() {
-            if pid == self.own_pid || self.wins.contains_key(&id) || self.ignored.contains(&id) {
+            // Known windows are skipped, unless Lanes lost track of one that's
+            // plainly on screen (it fell out of its app's window list).
+            let known = self.wins.get(&id).map(|w| w.present);
+            if pid == self.own_pid || known == Some(true) || self.ignored.contains(&id) {
                 continue;
             }
             if !pids.contains(&pid) {
@@ -2301,7 +2356,52 @@ impl Wm {
         }
     }
 
+    /// Notices a window entering or leaving macOS full screen. Returns true
+    /// when it is in full screen or just came back from it.
+    fn check_away(&mut self, id: u32) -> bool {
+        let Some(w) = self.wins.get(&id) else {
+            return false;
+        };
+        let was = w.away;
+        let now = ax::names(|n| ax::get_bool(&w.el, &n.fullscreen)).unwrap_or(false);
+        if now != was {
+            self.set_away(id, now);
+        }
+        was || now
+    }
+
+    fn set_away(&mut self, id: u32, away: bool) {
+        let cur = self.cur;
+        let Some(w) = self.wins.get_mut(&id) else {
+            return;
+        };
+        w.away = away;
+        w.back_at = (!away).then(Instant::now);
+        w.present = true;
+        w.applied = None;
+        w.parked = false;
+        w.touched = Instant::now();
+        let ctx = w.ctx;
+        crate::log!(
+            "full screen: window {id} {}",
+            if away { "entered" } else { "left" }
+        );
+        self.layout_needed = true;
+        if !away && ctx == cur {
+            // Back from full screen: it's the main app again, framed in the row.
+            self.anim = None;
+            self.ctxs[cur].focus = Some(id);
+            self.touch(id);
+            self.frame_window(id);
+        }
+    }
+
     fn on_resized(&mut self, id: u32) {
+        // Going into or coming out of full screen resizes the window: that's
+        // not you resizing it by hand.
+        if self.check_away(id) {
+            return;
+        }
         let usable = self.usable();
         let cur = self.cur;
         let Some(w) = self.wins.get_mut(&id) else {
@@ -2367,6 +2467,7 @@ impl Wm {
         self.ctxs[self.cur].order.iter().copied().find(|id| {
             self.wins.get(id).is_some_and(|w| {
                 !w.parked
+                    && !w.away
                     && w.applied
                         .is_some_and(|f| x >= f.x && x < f.x + f.w && y >= f.y && y < f.y + f.h)
             })
@@ -2379,6 +2480,14 @@ impl Wm {
     /// sweeping across windows on the way to the Dock wakes nothing.
     fn on_pointer(&mut self, x: f64, y: f64) {
         if !matches!(self.overlay, Overlay::None) || self.scrolling || self.anim.is_some() {
+            return;
+        }
+        // In a full-screen app the row's windows aren't there to point at.
+        if self.ctxs[self.cur]
+            .focus
+            .and_then(|f| self.wins.get(&f))
+            .is_some_and(|w| w.away)
+        {
             return;
         }
         let under = self.window_under(x, y);
@@ -2452,6 +2561,10 @@ impl Wm {
     }
 
     fn save(&self) {
+        // Never trade a saved layout for an empty one (e.g. while locked).
+        if self.wins.is_empty() {
+            return;
+        }
         let mut items = Vec::new();
         for (ci, c) in self.ctxs.iter().enumerate() {
             for (oi, id) in c.order.iter().enumerate() {
@@ -2489,7 +2602,7 @@ impl Wm {
             let Some(w) = self.wins.get_mut(&id) else {
                 continue;
             };
-            if !w.present {
+            if !w.present || w.away {
                 continue;
             }
             let size = ax::get_size(&w.el).unwrap_or(w.size);
