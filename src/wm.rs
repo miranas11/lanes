@@ -431,6 +431,8 @@ struct Wm {
     /// When each window last had focus (a counter), for "most recent first".
     used: HashMap<u32, u64>,
     use_tick: u64,
+    /// True while ⌃⌥-scrolling, so windows can slide in before slivers are tidied.
+    scrolling: bool,
 }
 
 fn read_screen(mtm: MainThreadMarker) -> Screen {
@@ -551,6 +553,7 @@ impl Wm {
             next_group,
             used: HashMap::new(),
             use_tick: 0,
+            scrolling: false,
         }
     }
 
@@ -907,10 +910,20 @@ impl Wm {
         let h = self.scr.h - 2.0 * GAP;
         let (left, right) = (self.scr.x, self.scr.x + self.scr.w);
 
+        // A neighbour showing only a thin sliver at the edge is hidden, so the
+        // main app is framed on its own. Never the window you're using, and
+        // not while you're scrolling (windows need to slide in smoothly).
+        let sliver = (self.scr.w * 0.2).max(160.0);
+        let focus = self.ctxs[cur].focus;
         // Show the current context first, then hide the rest: less flicker.
         for t in &tiles {
             let x = (origin + t.off).round();
-            let off_screen = x + t.w <= left + 1.0 || x >= right - 1.0;
+            let visible = (x + t.w).min(right) - x.max(left);
+            let is_sliver = !self.scrolling
+                && visible < t.w - 1.0
+                && visible < sliver
+                && !focus.is_some_and(|f| t.has(f));
+            let off_screen = x + t.w <= left + 1.0 || x >= right - 1.0 || is_sliver;
             for &(id, r) in &t.ids {
                 if off_screen {
                     self.park(id);
@@ -2004,12 +2017,17 @@ impl Wm {
                 self.overlay_enter();
             }
             Cmd::Scroll(d) => {
+                self.scrolling = true;
                 self.ctxs[self.cur].scroll += d;
                 self.layout_needed = true;
                 self.dots_needed = true;
                 ui::schedule_scroll_end();
             }
-            Cmd::ScrollEnd => self.after_scroll(),
+            Cmd::ScrollEnd => {
+                self.scrolling = false;
+                self.after_scroll();
+                self.layout_needed = true;
+            }
             Cmd::AppChanged(pid) => {
                 if self.apps.contains_key(&pid) {
                     self.refresh_app(pid);
