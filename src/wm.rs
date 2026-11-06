@@ -85,6 +85,8 @@ pub enum Cmd {
     Pointer(f64, f64),
     /// The pointer stayed in a window: focus it.
     HoverCommit(f64, f64),
+    /// Make the focused window's app active (deferred from pointer moves).
+    Activate,
     Quit,
 }
 
@@ -1919,6 +1921,7 @@ impl Wm {
                 | Cmd::Outline(_)
                 | Cmd::Pointer(..)
                 | Cmd::HoverCommit(..)
+                | Cmd::Activate
         ) {
             crate::log!("command: {c:?}");
         }
@@ -2123,6 +2126,11 @@ impl Wm {
             Cmd::GlideTick => self.glide_tick(),
             Cmd::Pointer(x, y) => self.on_pointer(x, y),
             Cmd::HoverCommit(x, y) => self.on_hover_commit(x, y),
+            Cmd::Activate => {
+                if let Some(f) = self.ctxs[self.cur].focus {
+                    self.focus(f);
+                }
+            }
             Cmd::Outline(on) => {
                 self.outline = on;
                 if !on {
@@ -2367,7 +2375,7 @@ impl Wm {
 
     /// The pointer moved. When it crosses into another window, that window
     /// becomes the main one: right away while ⌃⌥ is held (the outline jumps
-    /// to it), otherwise after a 70 ms pause counted from entering it, so
+    /// to it), otherwise after a 40 ms pause counted from entering it, so
     /// sweeping across windows on the way to the Dock wakes nothing.
     fn on_pointer(&mut self, x: f64, y: f64) {
         if !matches!(self.overlay, Overlay::None) || self.scrolling || self.anim.is_some() {
@@ -2387,12 +2395,14 @@ impl Wm {
             return;
         }
         if self.outline {
-            // ⌃⌥ held: you're aiming. Move the outline now, focus right behind it.
+            // ⌃⌥ held: you're aiming. The outline moves now; making the app
+            // active (a slow call into it) happens right after, only for the
+            // window the pointer settles in, so moving never stutters.
             self.ctxs[self.cur].focus = Some(id);
             self.update_outline();
-            self.focus(id);
+            ui::schedule_activate(0.015);
         } else {
-            ui::schedule_hover_commit(x, y, 0.07);
+            ui::schedule_hover_commit(x, y, 0.04);
         }
     }
 

@@ -174,6 +174,11 @@ define_class!(
             wm::push(Cmd::AppChanged(n.intValue()));
         }
 
+        #[unsafe(method(activateFocus:))]
+        fn activate_focus(&self, _o: Option<&AnyObject>) {
+            wm::push(Cmd::Activate);
+        }
+
         #[unsafe(method(hoverCommit:))]
         fn hover_commit(&self, _o: Option<&AnyObject>) {
             let (x, y) = HOVER_AT.get();
@@ -334,6 +339,11 @@ pub fn follow_mouse() -> bool {
 pub fn schedule_hover_commit(x: f64, y: f64, delay: f64) {
     HOVER_AT.set((x, y));
     debounce(sel!(hoverCommit:), delay);
+}
+
+/// Activate the focused window's app shortly, once the pointer settles.
+pub fn schedule_activate(delay: f64) {
+    debounce(sel!(activateFocus:), delay);
 }
 
 pub fn cancel_hover_commit() {
@@ -1432,15 +1442,11 @@ pub fn show_outline(x: f64, y: f64, w: f64, h: f64) {
             let soft = NSColor::controlAccentColor().colorWithAlphaComponent(0.45);
             l.setBorderColor(Some(&soft.CGColor()));
         }
-        if panel.isVisible() {
-            // Glide the ring to the new window.
-            NSAnimationContext::beginGrouping();
-            NSAnimationContext::currentContext().setDuration(0.12);
-            let anim: Retained<NSPanel> = unsafe { msg_send![&*panel, animator] };
-            anim.setFrame_display(frame, true);
-            NSAnimationContext::endGrouping();
-        } else {
+        // Jump straight there: no animation.
+        if panel.frame() != frame {
             panel.setFrame_display(frame, true);
+        }
+        if !panel.isVisible() {
             panel.setAlphaValue(1.0);
             panel.orderFrontRegardless();
         }
