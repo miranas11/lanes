@@ -136,6 +136,7 @@ thread_local! {
     static SWALLOW_UP: Cell<u8> = const { Cell::new(0) };
     /// The last single arrow that picked a half, for tapped corners.
     static LAST_SINGLE: Cell<Option<(Instant, u8)>> = const { Cell::new(None) };
+    static OUTLINE_ON: Cell<bool> = const { Cell::new(false) };
     static TAP: RefCell<Option<CFRetained<CFMachPort>>> = const { RefCell::new(None) };
     static LAST_ROW_SCROLL: Cell<Option<Instant>> = const { Cell::new(None) };
 }
@@ -144,6 +145,7 @@ thread_local! {
 pub fn install() -> bool {
     let mask: u64 = (1 << CGEventType::KeyDown.0)
         | (1 << CGEventType::KeyUp.0)
+        | (1 << CGEventType::FlagsChanged.0)
         | (1 << CGEventType::ScrollWheel.0)
         | (1 << CGEventType::LeftMouseDown.0)
         | (1 << CGEventType::RightMouseDown.0);
@@ -192,6 +194,9 @@ unsafe extern "C-unwind" fn callback(
         on_key(e)
     } else if ty == CGEventType::KeyUp {
         on_key_up(e)
+    } else if ty == CGEventType::FlagsChanged {
+        on_flags(e);
+        false
     } else if ty == CGEventType::ScrollWheel {
         on_scroll(e)
     } else if ty == CGEventType::LeftMouseDown || ty == CGEventType::RightMouseDown {
@@ -396,6 +401,18 @@ fn on_key_up(e: &CGEvent) -> bool {
         }
     }
     true
+}
+
+/// ⌃⌥ down: outline the focused window; released: remove the outline.
+fn on_flags(e: &CGEvent) {
+    if wm::mode() == Mode::Off {
+        return;
+    }
+    let held = Mods::of(e).chord();
+    if held != OUTLINE_ON.get() {
+        OUTLINE_ON.set(held);
+        wm::push(Cmd::Outline(held));
+    }
 }
 
 /// Forget half-finished arrow presses (when ⌃⌥Space starts or ends).

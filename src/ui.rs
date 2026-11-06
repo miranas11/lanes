@@ -232,6 +232,7 @@ struct Ui {
     item: Retained<NSStatusItem>,
     hud: Option<Retained<NSPanel>>,
     dots: Option<Retained<NSPanel>>,
+    outline: Option<Retained<NSPanel>>,
     overview: Option<Retained<NSPanel>>,
     tiles: Vec<Retained<NSView>>,
     dots_key: Option<(usize, Option<usize>)>,
@@ -384,6 +385,7 @@ pub fn init(mtm: MainThreadMarker) {
             item,
             hud: None,
             dots: None,
+            outline: None,
             overview: None,
             tiles: Vec::new(),
             dots_key: None,
@@ -1297,6 +1299,50 @@ pub fn show_area_map(title: &str, taken: &[bool; 9], filling: bool, lit: Option<
         0.5,
         None,
     );
+}
+
+/// A rounded accent-coloured ring around a window (frame in AppKit coordinates).
+pub fn show_outline(x: f64, y: f64, w: f64, h: f64) {
+    UI.with_borrow_mut(|u| {
+        let Some(u) = u else { return };
+        let mtm = u.mtm;
+        let pad = 3.0;
+        let frame = rect(x - pad, y - pad, w + 2.0 * pad, h + 2.0 * pad);
+        let panel = u
+            .outline
+            .get_or_insert_with(|| {
+                let p = make_panel(mtm, true);
+                p.setHasShadow(false);
+                // Above app windows, below Lanes' own panels.
+                p.setLevel(3);
+                let ring = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, 10.0, 10.0));
+                ring.setWantsLayer(true);
+                if let Some(l) = ring.layer() {
+                    l.setBorderWidth(4.0);
+                    l.setCornerRadius(14.0);
+                }
+                p.setContentView(Some(&ring));
+                p
+            })
+            .clone();
+        // The accent colour can change in System Settings, so set it each time.
+        if let Some(l) = panel.contentView().and_then(|v| v.layer()) {
+            l.setBorderColor(Some(&NSColor::controlAccentColor().CGColor()));
+        }
+        panel.setFrame_display(frame, true);
+        if !panel.isVisible() {
+            panel.setAlphaValue(1.0);
+            panel.orderFrontRegardless();
+        }
+    });
+}
+
+pub fn hide_outline() {
+    UI.with_borrow(|u| {
+        if let Some(p) = u.as_ref().and_then(|u| u.outline.as_ref()) {
+            p.orderOut(None);
+        }
+    });
 }
 
 pub fn hide_notice() {

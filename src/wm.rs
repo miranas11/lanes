@@ -79,6 +79,8 @@ pub enum Cmd {
     PlaceCancel,
     PlaceUngroup,
     GlideTick,
+    /// ⌃⌥ pressed (true) or released (false): outline the focused window.
+    Outline(bool),
     Quit,
 }
 
@@ -440,6 +442,8 @@ struct Wm {
     scrolling: bool,
     /// A glide of the row in progress (smooth snapping and ⌃⌥←/→).
     anim: Option<Glide>,
+    /// ⌃⌥ is held: the focused window is outlined.
+    outline: bool,
 }
 
 /// The row gliding from one scroll position to another.
@@ -447,7 +451,9 @@ struct Wm {
 struct Glide {
     from: f64,
     to: f64,
-    start: Instant,
+    /// Set on the first frame, not when asked: focusing a window can block
+    /// for ~100 ms, and starting the clock early would skip most of the glide.
+    start: Option<Instant>,
 }
 
 /// How long a glide takes. Short enough to feel instant, long enough to follow.
@@ -573,6 +579,7 @@ impl Wm {
             use_tick: 0,
             scrolling: false,
             anim: None,
+            outline: false,
         }
     }
 
@@ -1178,7 +1185,8 @@ impl Wm {
             self.touch(id);
             if self.ctxs[self.cur].focus != Some(id) {
                 self.ctxs[self.cur].focus = Some(id);
-                self.ensure_visible(id);
+                // You clicked a window that's partly off screen: glide it in.
+                self.frame_window(id);
             }
             return;
         }
@@ -1894,6 +1902,7 @@ impl Wm {
                 | Cmd::Scan
                 | Cmd::PlaceHover(_)
                 | Cmd::GlideTick
+                | Cmd::Outline(_)
         ) {
             crate::log!("command: {c:?}");
         }
@@ -2096,6 +2105,12 @@ impl Wm {
             Cmd::PlaceCancel => self.place_cancel(),
             Cmd::PlaceUngroup => self.place_ungroup(),
             Cmd::GlideTick => self.glide_tick(),
+            Cmd::Outline(on) => {
+                self.outline = on;
+                if !on {
+                    ui::hide_outline();
+                }
+            }
             Cmd::MouseDown(x, y) => {
                 let inside = matches!(
                     self.overlay,
@@ -2214,6 +2229,10 @@ impl Wm {
     /// Move the row to `target` smoothly (instantly with Reduce Motion).
     fn glide_to(&mut self, target: f64) {
         let from = self.ctxs[self.cur].scroll;
+        // Already gliding there (e.g. the app activating after ⌃⌥→): carry on.
+        if self.anim.is_some_and(|g| (g.to - target).abs() < 0.5) {
+            return;
+        }
         if (target - from).abs() < 0.5 {
             self.anim = None;
             return;
@@ -2231,7 +2250,7 @@ impl Wm {
         self.anim = Some(Glide {
             from,
             to: target,
-            start: Instant::now(),
+            start: None,
         });
         if !was_gliding {
             ui::schedule_glide_tick();
@@ -2240,10 +2259,12 @@ impl Wm {
 
     /// One frame of a glide: ease out (fast start, gentle landing).
     fn glide_tick(&mut self) {
-        let Some(g) = self.anim else {
+        let Some(mut g) = self.anim else {
             return;
         };
-        let t = (g.start.elapsed().as_secs_f64() * 1000.0 / GLIDE_MS).min(1.0);
+        let start = *g.start.get_or_insert_with(Instant::now);
+        self.anim = Some(g);
+        let t = (start.elapsed().as_secs_f64() * 1000.0 / GLIDE_MS).min(1.0);
         let eased = 1.0 - (1.0 - t).powi(3);
         self.ctxs[self.cur].scroll = g.from + (g.to - g.from) * eased;
         self.layout_needed = true;
@@ -2295,6 +2316,9 @@ impl Wm {
                 self.layout();
             }
         }
+        if self.outline {
+            self.update_outline();
+        }
         if self.dots_needed {
             self.dots_needed = false;
             let ids = self.row_ids();
@@ -2309,6 +2333,32 @@ impl Wm {
             self.save_needed = false;
             ui::schedule_save();
         }
+    }
+
+    /// Draw the outline around the window the shortcuts act on, where Lanes
+    /// last put it (no extra calls to the app). Hidden if it's off screen.
+    fn update_outline(&self) {
+        let Some(w) = self.ctxs[self.cur].focus.and_then(|f| self.wins.get(&f)) else {
+            ui::hide_outline();
+            return;
+        };
+        if w.parked || !self.shown(w) {
+            ui::hide_outline();
+            return;
+        }
+        let f = match w.applied {
+            Some(f) => (f.x, f.y, f.w, f.h),
+            None => match (ax::get_point(&w.el), ax::get_size(&w.el)) {
+                (Some(p), Some(s)) => (p.x, p.y, s.width, s.height),
+                _ => {
+                    ui::hide_outline();
+                    return;
+                }
+            },
+        };
+        // Accessibility uses a top-left origin; AppKit a bottom-left one.
+        let primary_h = self.scr.full.3;
+        ui::show_outline(f.0, primary_h - (f.1 + f.3), f.2, f.3);
     }
 
     fn save(&self) {
