@@ -146,6 +146,7 @@ pub fn install() -> bool {
     let mask: u64 = (1 << CGEventType::KeyDown.0)
         | (1 << CGEventType::KeyUp.0)
         | (1 << CGEventType::FlagsChanged.0)
+        | (1 << CGEventType::MouseMoved.0)
         | (1 << CGEventType::ScrollWheel.0)
         | (1 << CGEventType::LeftMouseDown.0)
         | (1 << CGEventType::RightMouseDown.0);
@@ -196,6 +197,13 @@ unsafe extern "C-unwind" fn callback(
         on_key_up(e)
     } else if ty == CGEventType::FlagsChanged {
         on_flags(e);
+        false
+    } else if ty == CGEventType::MouseMoved {
+        // Focus follows the pointer once it rests on a window for a moment.
+        if wm::mode() == Mode::Normal && crate::ui::follow_mouse() {
+            let p = CGEvent::location(Some(e));
+            crate::ui::schedule_hover(p.x, p.y);
+        }
         false
     } else if ty == CGEventType::ScrollWheel {
         on_scroll(e)

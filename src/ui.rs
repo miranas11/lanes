@@ -27,7 +27,7 @@ use objc2_app_kit::{
 use objc2_core_foundation::{CGFloat, CGPoint, CGRect, CGSize};
 use objc2_foundation::{
     NSArray, NSDictionary, NSNotification, NSNotificationCenter, NSNumber, NSRunLoopCommonModes,
-    NSString, NSURL,
+    NSString, NSURL, NSUserDefaults,
 };
 
 use crate::store;
@@ -59,6 +59,8 @@ const TAG_ACCESSIBILITY: isize = 30;
 const TAG_QUIT: isize = 31;
 const TAG_DESKTOPS: isize = 32;
 const TAG_LOG: isize = 33;
+const TAG_FOLLOW: isize = 34;
+const FOLLOW_OFF_KEY: &str = "focusFollowsMouseOff";
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -84,6 +86,17 @@ define_class!(
                 TAG_ACCESSIBILITY => open_accessibility_settings(),
                 TAG_DESKTOPS => open_mission_control(),
                 TAG_LOG => open_log(),
+                TAG_FOLLOW => {
+                    let on = !follow_mouse();
+                    FOLLOW.set(on);
+                    let defaults = NSUserDefaults::standardUserDefaults();
+                    defaults.setBool_forKey(!on, &NSString::from_str(FOLLOW_OFF_KEY));
+                    let (names, cur) = UI.with_borrow(|u| match u {
+                        Some(u) => (u.names.clone(), u.cur),
+                        None => (Vec::new(), 0),
+                    });
+                    rebuild_menu(&names, cur);
+                }
                 TAG_QUIT => {
                     if wm::mode() == wm::Mode::Off {
                         terminate();
@@ -159,6 +172,12 @@ define_class!(
         #[unsafe(method(refreshPid:))]
         fn refresh_pid(&self, n: &NSNumber) {
             wm::push(Cmd::AppChanged(n.intValue()));
+        }
+
+        #[unsafe(method(hoverCheck:))]
+        fn hover_check(&self, _o: Option<&AnyObject>) {
+            let (x, y) = HOVER_AT.get();
+            wm::push(Cmd::Hover(x, y));
         }
 
         #[unsafe(method(glideTick:))]
@@ -247,6 +266,8 @@ thread_local! {
     static CTRL: OnceCell<Retained<Controller>> = const { OnceCell::new() };
     static UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
     static DRAIN_SCHEDULED: Cell<bool> = const { Cell::new(false) };
+    static FOLLOW: Cell<bool> = const { Cell::new(true) };
+    static HOVER_AT: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
 }
 
 fn ctrl() -> Option<Retained<Controller>> {
@@ -304,6 +325,17 @@ pub fn schedule_trust_poll() {
 }
 
 /// Next frame of a glide, about 60 times a second.
+/// Focus follows the mouse (on unless turned off in the menu).
+pub fn follow_mouse() -> bool {
+    FOLLOW.get()
+}
+
+/// The pointer moved: check what's under it once it has rested 0.15 s.
+pub fn schedule_hover(x: f64, y: f64) {
+    HOVER_AT.set((x, y));
+    debounce(sel!(hoverCheck:), 0.15);
+}
+
 pub fn schedule_glide_tick() {
     perform(sel!(glideTick:), None, 1.0 / 60.0);
 }
@@ -362,6 +394,9 @@ fn edit_contexts() {
 // ---------------------------------------------------------------- setup
 
 pub fn init(mtm: MainThreadMarker) {
+    let off =
+        NSUserDefaults::standardUserDefaults().boolForKey(&NSString::from_str(FOLLOW_OFF_KEY));
+    FOLLOW.set(!off);
     let c = Controller::new(mtm);
     CTRL.with(|cell| {
         let _ = cell.set(c);
@@ -577,6 +612,19 @@ pub fn rebuild_menu(names: &[String], cur: usize) {
             NSEventModifierFlags::empty(),
         ));
         menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let follow = menu_item(
+            mtm,
+            "Focus Follows Mouse",
+            TAG_FOLLOW,
+            "",
+            NSEventModifierFlags::empty(),
+        );
+        follow.setState(if follow_mouse() {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
+        menu.addItem(&follow);
         menu.addItem(&menu_item(
             mtm,
             "Show Log",
@@ -1319,7 +1367,7 @@ pub fn show_outline(x: f64, y: f64, w: f64, h: f64) {
                 let ring = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, 10.0, 10.0));
                 ring.setWantsLayer(true);
                 if let Some(l) = ring.layer() {
-                    l.setBorderWidth(2.0);
+                    l.setBorderWidth(3.0);
                     l.setCornerRadius(13.0);
                 }
                 p.setContentView(Some(&ring));

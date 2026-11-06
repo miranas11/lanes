@@ -81,6 +81,8 @@ pub enum Cmd {
     GlideTick,
     /// ⌃⌥ pressed (true) or released (false): outline the focused window.
     Outline(bool),
+    /// The pointer rested at (x, y): focus the window under it.
+    Hover(f64, f64),
     Quit,
 }
 
@@ -1903,6 +1905,7 @@ impl Wm {
                 | Cmd::PlaceHover(_)
                 | Cmd::GlideTick
                 | Cmd::Outline(_)
+                | Cmd::Hover(..)
         ) {
             crate::log!("command: {c:?}");
         }
@@ -2105,6 +2108,7 @@ impl Wm {
             Cmd::PlaceCancel => self.place_cancel(),
             Cmd::PlaceUngroup => self.place_ungroup(),
             Cmd::GlideTick => self.glide_tick(),
+            Cmd::Hover(x, y) => self.on_hover(x, y),
             Cmd::Outline(on) => {
                 self.outline = on;
                 if !on {
@@ -2333,6 +2337,37 @@ impl Wm {
             self.save_needed = false;
             ui::schedule_save();
         }
+    }
+
+    /// Focus follows the pointer: the window under it becomes the main one.
+    /// It only switches focus; it never scrolls the row.
+    fn on_hover(&mut self, x: f64, y: f64) {
+        if !matches!(self.overlay, Overlay::None) || self.scrolling || self.anim.is_some() {
+            return;
+        }
+        // Cheap check first: is the pointer over one of our placed windows at all?
+        let over_ours = self.ctxs[self.cur].order.iter().any(|id| {
+            self.wins.get(id).is_some_and(|w| {
+                !w.parked
+                    && w.applied
+                        .is_some_and(|f| x >= f.x && x < f.x + f.w && y >= f.y && y < f.y + f.h)
+            })
+        });
+        if !over_ours {
+            return;
+        }
+        // Then ask what's really there, so menus and pop-ups never lose focus.
+        let Some(id) = ax::window_at(x, y) else {
+            return;
+        };
+        let Some(w) = self.wins.get(&id) else {
+            return;
+        };
+        if w.ctx != self.cur || w.parked || self.ctxs[self.cur].focus == Some(id) {
+            return;
+        }
+        self.ctxs[self.cur].focus = Some(id);
+        self.focus(id);
     }
 
     /// Draw the outline around the window the shortcuts act on, where Lanes

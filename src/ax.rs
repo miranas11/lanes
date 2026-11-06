@@ -28,6 +28,7 @@ unsafe extern "C" {
 pub struct Names {
     pub windows: CFRetained<CFString>,
     pub focused_window: CFRetained<CFString>,
+    pub window: CFRetained<CFString>,
     pub main: CFRetained<CFString>,
     pub frontmost: CFRetained<CFString>,
     pub position: CFRetained<CFString>,
@@ -53,6 +54,7 @@ impl Names {
         Self {
             windows: s("AXWindows"),
             focused_window: s("AXFocusedWindow"),
+            window: s("AXWindow"),
             main: s("AXMain"),
             frontmost: s("AXFrontmost"),
             position: s("AXPosition"),
@@ -194,6 +196,32 @@ pub fn window_id(el: &AXUIElement) -> Option<u32> {
 /// False once the element's process or window is gone.
 pub fn is_alive(el: &AXUIElement) -> bool {
     !matches!(names(|n| copy(el, &n.role)), Err(AXError::InvalidUIElement))
+}
+
+/// The id of the window whose content is under the pointer (global,
+/// top-left origin). None over menus, pop-ups, dialogs or the desktop
+/// (anything that isn't a window's own content).
+pub fn window_at(x: f64, y: f64) -> Option<u32> {
+    let system = unsafe { AXUIElement::new_system_wide() };
+    let mut out: *const AXUIElement = ptr::null();
+    let err =
+        unsafe { system.copy_element_at_position(x as f32, y as f32, NonNull::from(&mut out)) };
+    if err != AXError::Success {
+        return None;
+    }
+    let el = unsafe { CFRetained::from_raw(NonNull::new(out as *mut AXUIElement)?) };
+    // The element itself may be the window; otherwise ask for its window.
+    if let Some(id) = names(|n| get_string(&el, &n.role))
+        .filter(|r| r == "AXWindow")
+        .and_then(|_| window_id(&el))
+    {
+        return Some(id);
+    }
+    let win = names(|n| copy(&el, &n.window))
+        .ok()?
+        .downcast::<AXUIElement>()
+        .ok()?;
+    window_id(&win)
 }
 
 pub fn raise(el: &AXUIElement) {
