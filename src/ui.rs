@@ -1221,127 +1221,176 @@ fn fill_app_tile(mtm: MainThreadMarker, t: &AppTile, v: &NSView) {
     }
 }
 
-/// ⌃⌥Space: a small map of the nine areas, each with its arrows and a
-/// picture of the area. `lit` is the area the held arrows would pick.
+/// A small rounded key with an arrow on it.
+fn keycap(mtm: MainThreadMarker, arrow: &str, cx: f64, cy: f64, lit: bool) -> Retained<NSView> {
+    let (w, h) = (24.0, 22.0);
+    let cap = NSView::initWithFrame(NSView::alloc(mtm), rect(cx - w / 2.0, cy - h / 2.0, w, h));
+    cap.setWantsLayer(true);
+    if let Some(l) = cap.layer() {
+        l.setCornerRadius(6.0);
+        l.setBorderWidth(if lit { 0.0 } else { 0.75 });
+        l.setBorderColor(Some(
+            &NSColor::labelColor()
+                .colorWithAlphaComponent(0.16)
+                .CGColor(),
+        ));
+    }
+    let bg = if lit {
+        NSColor::controlAccentColor()
+    } else {
+        NSColor::labelColor().colorWithAlphaComponent(0.07)
+    };
+    set_bg(&cap, Some(&bg));
+    let t = label(
+        mtm,
+        arrow,
+        12.0,
+        unsafe { NSFontWeightSemibold },
+        !lit,
+        NSTextAlignment::Center,
+    );
+    if lit {
+        t.setTextColor(Some(&NSColor::whiteColor()));
+    }
+    t.setFrame(rect(0.0, 3.0, w, 15.0));
+    cap.addSubview(&t);
+    cap
+}
+
+/// ⌃⌥Space: arrow keys arranged around a miniature screen, each where it
+/// points. Held arrows light up and the area they'd pick fills in softly;
+/// areas already in use are shaded. `lit` is the area the held arrows pick.
 pub fn show_area_map(title: &str, taken: &[bool; 9], filling: bool, lit: Option<usize>) {
     show_hud(
         |mtm| {
-            let (cw, ch, gap, pad) = (104.0, 50.0, 8.0, 18.0);
-            let width = 3.0 * cw + 2.0 * gap + 2.0 * pad;
-            let height = pad + 30.0 + 3.0 * ch + 2.0 * gap + 26.0 + pad - 8.0;
+            let (width, height) = (340.0, 286.0);
             let size = CGSize::new(width, height);
-            let g = glass(mtm, size, 22.0);
-            let title = label(
+            let g = glass(mtm, size, 24.0);
+
+            let t = label(
                 mtm,
                 title,
-                15.0,
+                14.0,
                 unsafe { NSFontWeightSemibold },
                 false,
                 NSTextAlignment::Center,
             );
-            title.setFrame(rect(pad, height - pad - 22.0, width - 2.0 * pad, 20.0));
-            g.addSubview(&title);
-            let accent = NSColor::controlAccentColor();
-            let cell_bg = NSColor::labelColor().colorWithAlphaComponent(0.08);
-            let frame_c = NSColor::secondaryLabelColor().CGColor();
-            let key_bg = NSColor::labelColor().colorWithAlphaComponent(0.12);
-            let key_edge = NSColor::labelColor()
-                .colorWithAlphaComponent(0.28)
-                .CGColor();
-            for (i, &is_taken) in taken.iter().enumerate() {
-                // The middle stays empty: full screen is not offered here.
-                if i == crate::layout::MIDDLE {
-                    continue;
-                }
-                let (col, row) = ((i % 3) as f64, (i / 3) as f64);
-                let x = pad + col * (cw + gap);
-                let y = height - pad - 30.0 - (row + 1.0) * ch - row * gap;
-                let cell = NSView::initWithFrame(NSView::alloc(mtm), rect(x, y, cw, ch));
-                cell.setWantsLayer(true);
-                if let Some(l) = cell.layer() {
-                    l.setCornerRadius(10.0);
-                }
-                if lit == Some(i) {
-                    set_bg(&cell, Some(&accent.colorWithAlphaComponent(0.35)));
-                } else {
-                    set_bg(&cell, Some(&cell_bg));
-                }
-                // Each arrow drawn as a small key, so a corner reads as two keys.
-                let (kw, kh, kgap) = (22.0, 22.0, 4.0);
-                for (k, arrow) in crate::layout::AREA_ARROWS[i].split_whitespace().enumerate() {
-                    let cap = NSView::initWithFrame(
-                        NSView::alloc(mtm),
-                        rect(10.0 + k as f64 * (kw + kgap), (ch - kh) / 2.0, kw, kh),
-                    );
-                    cap.setWantsLayer(true);
-                    if let Some(l) = cap.layer() {
-                        l.setCornerRadius(5.0);
-                        l.setBorderWidth(1.0);
-                        l.setBorderColor(Some(&key_edge));
-                    }
-                    set_bg(&cap, Some(&key_bg));
-                    let t = label(
-                        mtm,
-                        arrow,
-                        13.0,
-                        unsafe { NSFontWeightSemibold },
-                        false,
-                        NSTextAlignment::Center,
-                    );
-                    t.setFrame(rect(0.0, 3.0, kw, 16.0));
-                    cap.addSubview(&t);
-                    cell.addSubview(&cap);
-                }
-                // A tiny screen with this key's area filled in.
-                let (sw, sh) = (34.0, 22.0);
-                let screen = NSView::initWithFrame(
-                    NSView::alloc(mtm),
-                    rect(cw - sw - 10.0, (ch - sh) / 2.0, sw, sh),
+            t.setFrame(rect(20.0, height - 40.0, width - 40.0, 20.0));
+            g.addSubview(&t);
+
+            // The miniature screen, 16:10, with a hint of a menu bar.
+            let (sw, sh) = (196.0, 122.0);
+            let (x0, y0) = ((width - sw) / 2.0, 82.0);
+            let screen = NSView::initWithFrame(NSView::alloc(mtm), rect(x0, y0, sw, sh));
+            screen.setWantsLayer(true);
+            if let Some(l) = screen.layer() {
+                l.setCornerRadius(9.0);
+                l.setBorderWidth(1.0);
+                l.setBorderColor(Some(
+                    &NSColor::labelColor()
+                        .colorWithAlphaComponent(0.22)
+                        .CGColor(),
+                ));
+                l.setMasksToBounds(true);
+            }
+            set_bg(
+                &screen,
+                Some(&NSColor::labelColor().colorWithAlphaComponent(0.04)),
+            );
+            let bar = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, sh - 7.0, sw, 7.0));
+            bar.setWantsLayer(true);
+            set_bg(
+                &bar,
+                Some(&NSColor::labelColor().colorWithAlphaComponent(0.08)),
+            );
+            screen.addSubview(&bar);
+            // Faint centre lines hint at halves and quarters.
+            let inner_h = sh - 7.0;
+            for (fx, fy, fw, fh) in [
+                (sw / 2.0 - 0.25, 0.0, 0.5, inner_h),
+                (0.0, inner_h / 2.0 - 0.25, sw, 0.5),
+            ] {
+                let line = NSView::initWithFrame(NSView::alloc(mtm), rect(fx, fy, fw, fh));
+                line.setWantsLayer(true);
+                set_bg(
+                    &line,
+                    Some(&NSColor::labelColor().colorWithAlphaComponent(0.10)),
                 );
-                screen.setWantsLayer(true);
-                if let Some(l) = screen.layer() {
-                    l.setCornerRadius(4.0);
-                    l.setBorderWidth(1.2);
-                    l.setBorderColor(Some(&frame_c));
-                }
-                let r = crate::layout::AREAS[i];
-                let inset = 2.5;
-                let (iw, ih) = (sw - 2.0 * inset, sh - 2.0 * inset);
-                let fill = NSView::initWithFrame(
+                screen.addSubview(&line);
+            }
+            // Areas in use (shaded) and the one the held arrows pick (accent).
+            let area_view = |r: [f64; 4], color: &NSColor| {
+                let inset = 3.0;
+                let v = NSView::initWithFrame(
                     NSView::alloc(mtm),
                     rect(
-                        inset + r[0] * iw,
-                        inset + (1.0 - r[1] - r[3]) * ih,
-                        (r[2] * iw).max(2.0),
-                        (r[3] * ih).max(2.0),
+                        inset + r[0] * (sw - 2.0 * inset),
+                        inset + (1.0 - r[1] - r[3]) * (inner_h - 2.0 * inset),
+                        r[2] * (sw - 2.0 * inset) - 2.0,
+                        r[3] * (inner_h - 2.0 * inset) - 2.0,
                     ),
                 );
-                fill.setWantsLayer(true);
-                if let Some(l) = fill.layer() {
-                    l.setCornerRadius(1.5);
+                v.setWantsLayer(true);
+                if let Some(l) = v.layer() {
+                    l.setCornerRadius(5.0);
                 }
-                set_bg(&fill, Some(&accent));
-                screen.addSubview(&fill);
-                cell.addSubview(&screen);
-                if is_taken {
-                    cell.setAlphaValue(0.35);
+                set_bg(&v, Some(color));
+                v
+            };
+            let used = NSColor::labelColor().colorWithAlphaComponent(0.12);
+            for (i, &is_taken) in taken.iter().enumerate() {
+                if is_taken && i != crate::layout::MIDDLE {
+                    screen.addSubview(&area_view(crate::layout::AREAS[i], &used));
                 }
-                g.addSubview(&cell);
             }
-            let foot = label(
+            if let Some(i) = lit {
+                let soft = NSColor::controlAccentColor().colorWithAlphaComponent(0.55);
+                screen.addSubview(&area_view(crate::layout::AREAS[i], &soft));
+            }
+            g.addSubview(&screen);
+
+            // Keys along the screen's edges, each where it points.
+            let top = y0 + sh + 18.0;
+            let bottom = y0 - 18.0;
+            let mid = y0 + sh / 2.0;
+            let spots: [(usize, f64, f64); 8] = [
+                (0, x0 + 26.0, top),
+                (1, width / 2.0, top),
+                (2, x0 + sw - 26.0, top),
+                (3, x0 - 22.0, mid),
+                (5, x0 + sw + 22.0, mid),
+                (6, x0 + 26.0, bottom),
+                (7, width / 2.0, bottom),
+                (8, x0 + sw - 26.0, bottom),
+            ];
+            for (i, cx, cy) in spots {
+                let arrows: Vec<&str> = crate::layout::AREA_ARROWS[i].split_whitespace().collect();
+                let on = lit == Some(i);
+                let n = arrows.len() as f64;
+                for (k, a) in arrows.iter().enumerate() {
+                    let x = cx + (k as f64 - (n - 1.0) / 2.0) * 27.0;
+                    let cap = keycap(mtm, a, x, cy, on);
+                    if taken[i] && !on {
+                        cap.setAlphaValue(0.35);
+                    }
+                    g.addSubview(&cap);
+                }
+            }
+
+            let hint = label(
                 mtm,
                 if filling {
-                    "⌫ separate windows   ↩ done   esc undo"
+                    "⌫ separate   ·   ↩ done   ·   esc undo"
                 } else {
-                    "hold two arrows for a corner   esc cancel"
+                    "Hold two arrows for a corner   ·   esc"
                 },
                 11.0,
-                unsafe { NSFontWeightMedium },
+                unsafe { NSFontWeightRegular },
                 true,
                 NSTextAlignment::Center,
             );
-            foot.setFrame(rect(pad, pad - 6.0, width - 2.0 * pad, 16.0));
-            g.addSubview(&foot);
+            hint.setFrame(rect(20.0, 18.0, width - 40.0, 16.0));
+            g.addSubview(&hint);
             (Retained::into_super(g), size)
         },
         0.5,
