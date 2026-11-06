@@ -81,8 +81,10 @@ pub enum Cmd {
     GlideTick,
     /// ⌃⌥ pressed (true) or released (false): outline the focused window.
     Outline(bool),
-    /// The pointer rested at (x, y): focus the window under it.
-    Hover(f64, f64),
+    /// The pointer moved to (x, y).
+    Pointer(f64, f64),
+    /// The pointer stayed in a window: focus it.
+    HoverCommit(f64, f64),
     Quit,
 }
 
@@ -110,6 +112,13 @@ pub fn push(c: Cmd) {
             && let Some(Cmd::Scroll(prev)) = q.last_mut()
         {
             *prev += d;
+            return;
+        }
+        // Only the latest pointer position matters.
+        if let Cmd::Pointer(..) = c
+            && let Some(last @ Cmd::Pointer(..)) = q.last_mut()
+        {
+            *last = c;
             return;
         }
         let dedupe = matches!(
@@ -446,6 +455,8 @@ struct Wm {
     anim: Option<Glide>,
     /// ⌃⌥ is held: the focused window is outlined.
     outline: bool,
+    /// The placed window the pointer is over (by geometry).
+    hover: Option<u32>,
 }
 
 /// The row gliding from one scroll position to another.
@@ -582,6 +593,7 @@ impl Wm {
             scrolling: false,
             anim: None,
             outline: false,
+            hover: None,
         }
     }
 
@@ -1905,7 +1917,8 @@ impl Wm {
                 | Cmd::PlaceHover(_)
                 | Cmd::GlideTick
                 | Cmd::Outline(_)
-                | Cmd::Hover(..)
+                | Cmd::Pointer(..)
+                | Cmd::HoverCommit(..)
         ) {
             crate::log!("command: {c:?}");
         }
@@ -2108,7 +2121,8 @@ impl Wm {
             Cmd::PlaceCancel => self.place_cancel(),
             Cmd::PlaceUngroup => self.place_ungroup(),
             Cmd::GlideTick => self.glide_tick(),
-            Cmd::Hover(x, y) => self.on_hover(x, y),
+            Cmd::Pointer(x, y) => self.on_pointer(x, y),
+            Cmd::HoverCommit(x, y) => self.on_hover_commit(x, y),
             Cmd::Outline(on) => {
                 self.outline = on;
                 if !on {
@@ -2339,34 +2353,65 @@ impl Wm {
         }
     }
 
-    /// Focus follows the pointer: the window under it becomes the main one.
-    /// It only switches focus; it never scrolls the row.
-    fn on_hover(&mut self, x: f64, y: f64) {
-        if !matches!(self.overlay, Overlay::None) || self.scrolling || self.anim.is_some() {
-            return;
-        }
-        // Cheap check first: is the pointer over one of our placed windows at all?
-        let over_ours = self.ctxs[self.cur].order.iter().any(|id| {
+    /// The placed window under the pointer, from frames Lanes already knows
+    /// (pure geometry, no calls to other apps, so it's instant).
+    fn window_under(&self, x: f64, y: f64) -> Option<u32> {
+        self.ctxs[self.cur].order.iter().copied().find(|id| {
             self.wins.get(id).is_some_and(|w| {
                 !w.parked
                     && w.applied
                         .is_some_and(|f| x >= f.x && x < f.x + f.w && y >= f.y && y < f.y + f.h)
             })
-        });
-        if !over_ours {
+        })
+    }
+
+    /// The pointer moved. When it crosses into another window, that window
+    /// becomes the main one: right away while ⌃⌥ is held (the outline jumps
+    /// to it), otherwise after a 70 ms pause counted from entering it, so
+    /// sweeping across windows on the way to the Dock wakes nothing.
+    fn on_pointer(&mut self, x: f64, y: f64) {
+        if !matches!(self.overlay, Overlay::None) || self.scrolling || self.anim.is_some() {
             return;
         }
-        // Then ask what's really there, so menus and pop-ups never lose focus.
-        let Some(id) = ax::window_at(x, y) else {
+        let under = self.window_under(x, y);
+        if under == self.hover {
+            return;
+        }
+        self.hover = under;
+        let Some(id) = under else {
+            ui::cancel_hover_commit();
             return;
         };
-        let Some(w) = self.wins.get(&id) else {
+        if self.ctxs[self.cur].focus == Some(id) {
+            ui::cancel_hover_commit();
+            return;
+        }
+        if self.outline {
+            // ⌃⌥ held: you're aiming. Move the outline now, focus right behind it.
+            self.ctxs[self.cur].focus = Some(id);
+            self.update_outline();
+            self.focus(id);
+        } else {
+            ui::schedule_hover_commit(x, y, 0.07);
+        }
+    }
+
+    /// The pointer stayed in a window long enough: make it the main one,
+    /// unless a menu or pop-up is really what's under the pointer.
+    fn on_hover_commit(&mut self, x: f64, y: f64) {
+        if !matches!(self.overlay, Overlay::None) || self.scrolling || self.anim.is_some() {
+            return;
+        }
+        let Some(id) = self.window_under(x, y) else {
             return;
         };
-        if w.ctx != self.cur || w.parked || self.ctxs[self.cur].focus == Some(id) {
+        if self.ctxs[self.cur].focus == Some(id) || ax::window_at(x, y) != Some(id) {
             return;
         }
         self.ctxs[self.cur].focus = Some(id);
+        if self.outline {
+            self.update_outline();
+        }
         self.focus(id);
     }
 

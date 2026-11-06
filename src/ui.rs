@@ -174,10 +174,10 @@ define_class!(
             wm::push(Cmd::AppChanged(n.intValue()));
         }
 
-        #[unsafe(method(hoverCheck:))]
-        fn hover_check(&self, _o: Option<&AnyObject>) {
+        #[unsafe(method(hoverCommit:))]
+        fn hover_commit(&self, _o: Option<&AnyObject>) {
             let (x, y) = HOVER_AT.get();
-            wm::push(Cmd::Hover(x, y));
+            wm::push(Cmd::HoverCommit(x, y));
         }
 
         #[unsafe(method(glideTick:))]
@@ -331,9 +331,13 @@ pub fn follow_mouse() -> bool {
 }
 
 /// The pointer moved: check what's under it once it has rested 0.15 s.
-pub fn schedule_hover(x: f64, y: f64) {
+pub fn schedule_hover_commit(x: f64, y: f64, delay: f64) {
     HOVER_AT.set((x, y));
-    debounce(sel!(hoverCheck:), 0.15);
+    debounce(sel!(hoverCommit:), delay);
+}
+
+pub fn cancel_hover_commit() {
+    cancel(sel!(hoverCommit:));
 }
 
 pub fn schedule_glide_tick() {
@@ -1428,8 +1432,15 @@ pub fn show_outline(x: f64, y: f64, w: f64, h: f64) {
             let soft = NSColor::controlAccentColor().colorWithAlphaComponent(0.45);
             l.setBorderColor(Some(&soft.CGColor()));
         }
-        panel.setFrame_display(frame, true);
-        if !panel.isVisible() {
+        if panel.isVisible() {
+            // Glide the ring to the new window.
+            NSAnimationContext::beginGrouping();
+            NSAnimationContext::currentContext().setDuration(0.12);
+            let anim: Retained<NSPanel> = unsafe { msg_send![&*panel, animator] };
+            anim.setFrame_display(frame, true);
+            NSAnimationContext::endGrouping();
+        } else {
+            panel.setFrame_display(frame, true);
             panel.setAlphaValue(1.0);
             panel.orderFrontRegardless();
         }

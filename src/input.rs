@@ -199,10 +199,10 @@ unsafe extern "C-unwind" fn callback(
         on_flags(e);
         false
     } else if ty == CGEventType::MouseMoved {
-        // Focus follows the pointer once it rests on a window for a moment.
+        // Focus follows the pointer.
         if wm::mode() == Mode::Normal && crate::ui::follow_mouse() {
             let p = CGEvent::location(Some(e));
-            crate::ui::schedule_hover(p.x, p.y);
+            wm::push(Cmd::Pointer(p.x, p.y));
         }
         false
     } else if ty == CGEventType::ScrollWheel {
