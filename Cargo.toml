@@ -1,0 +1,25 @@
+[package]
+name = "lanes"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight scrolling window manager for macOS with separate contexts"
+license = "MIT"
+publish = false
+
+[dependencies]
+libc = "0.2"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-core-foundation = "0.3"
+objc2-core-graphics = "0.3"
+objc2-application-services = "0.3"
+objc2-quartz-core = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
