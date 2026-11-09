@@ -336,7 +336,12 @@ fn on_key(e: &CGEvent) -> bool {
             }
         }
         Mode::Overview => {
+            // Shift + ← → carries the selected app along the row (⌃⌥ may
+            // still be held from opening the overview).
+            let carry = m.shift && !m.cmd;
             let cmd = match code {
+                kc::LEFT if carry => Some(Cmd::OvCarry(-1)),
+                kc::RIGHT if carry => Some(Cmd::OvCarry(1)),
                 kc::LEFT if m.none() || m.chord() => Some(Cmd::OvMove(-1, 0)),
                 kc::RIGHT if m.none() || m.chord() => Some(Cmd::OvMove(1, 0)),
                 kc::H if m.chord() => Some(Cmd::OvMove(-1, 0)),
@@ -352,7 +357,7 @@ fn on_key(e: &CGEvent) -> bool {
                 _ => None,
             };
             if let Some(c) = cmd {
-                if !repeat || matches!(c, Cmd::OvMove(..)) {
+                if !repeat || matches!(c, Cmd::OvMove(..) | Cmd::OvCarry(_)) {
                     wm::push(c);
                 }
                 return true;

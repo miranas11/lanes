@@ -37,6 +37,7 @@ Every shortcut is ⌃⌥ (Control + Option) plus one key on the right side of th
 | ⌃⌥[ / ⌃⌥] | Context on the left / right |
 | ⌃⌥1 … ⌃⌥9 | Go to a context |
 | ⌃⌥O | Show all apps in this context |
+| ⇧← / ⇧→ (in ⌃⌥O) | Move the selected app left / right in the row (the order is saved) |
 | ⌃⌥P | Show all contexts |
 | ⌃⌥↑ / ⌃⌥↓ | Zoom out / in one level |
 | ⌃⌥= / ⌃⌥- | Wider / narrower (⅓ · ½ · ⅔ · full) |

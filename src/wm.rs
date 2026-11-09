@@ -55,6 +55,8 @@ pub enum Cmd {
     ZoomOut,
     ZoomIn,
     OvMove(i32, i32),
+    /// Move the app selected in ⌃⌥O one stop left (-1) or right (1).
+    OvCarry(i32),
     OvEnter,
     OvClose,
     OvPick(usize),
@@ -1318,14 +1320,19 @@ impl Wm {
     }
 
     fn show_apps(&mut self) {
+        self.show_apps_at(None);
+    }
+
+    /// ⌃⌥O, with `select` highlighted (the focused window when None).
+    fn show_apps_at(&mut self, select: Option<u32>) {
         let ids = self.row_ids();
         if ids.is_empty() {
             self.close_overlay();
             ui::notice(&format!("{} has no windows", self.ctxs[self.cur].name), "");
             return;
         }
-        let sel = self.ctxs[self.cur]
-            .focus
+        let sel = select
+            .or(self.ctxs[self.cur].focus)
             .and_then(|f| ids.iter().position(|&x| x == f))
             .unwrap_or(0);
         let tiles: Vec<AppTile> = ids
@@ -1392,6 +1399,49 @@ impl Wm {
             *sel = next as usize;
             ui::select_tile(*sel);
         }
+    }
+
+    /// Shift + ← → in ⌃⌥O: the selected app swaps places with its neighbour
+    /// stop in the row (a screen of several apps moves as one). The row
+    /// behind the overview follows right away, and the order is saved.
+    fn overlay_carry(&mut self, d: i32) {
+        let Overlay::Apps { sel, ids, .. } = &self.overlay else {
+            return;
+        };
+        let Some(&id) = ids.get(*sel) else { return };
+        let cur = self.cur;
+        let (tiles, _) = self.tiles(cur);
+        let Some(i) = tiles.iter().position(|t| t.has(id)) else {
+            return;
+        };
+        let j = i as i32 + d;
+        if j < 0 || j as usize >= tiles.len() {
+            return;
+        }
+        let mut stops: Vec<Vec<u32>> = tiles
+            .iter()
+            .map(|t| t.ids.iter().map(|&(id, _)| id).collect())
+            .collect();
+        stops.swap(i, j as usize);
+        let moved: Vec<u32> = stops.into_iter().flatten().collect();
+        // Windows not in the row right now (hidden apps, other desktops) keep
+        // their slots; the row's windows fill the rest in the new order.
+        let order = &mut self.ctxs[cur].order;
+        let mut next = moved.into_iter();
+        for slot in order.iter_mut() {
+            if tiles.iter().any(|t| t.has(*slot))
+                && let Some(n) = next.next()
+            {
+                *slot = n;
+            }
+        }
+        if let Some(f) = self.ctxs[cur].focus {
+            self.anim = None;
+            self.ensure_visible(f);
+        }
+        self.layout();
+        self.save_needed = true;
+        self.show_apps_at(Some(id));
     }
 
     fn overlay_enter(&mut self) {
@@ -2122,6 +2172,7 @@ impl Wm {
             },
             Cmd::OvMove(dx, dy) => self.overlay_move(dx, dy),
             Cmd::OvEnter => self.overlay_enter(),
+            Cmd::OvCarry(d) => self.overlay_carry(d),
             Cmd::OvPick(i) => {
                 match &mut self.overlay {
                     Overlay::Apps { sel, .. }

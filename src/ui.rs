@@ -1156,7 +1156,7 @@ pub fn show_apps(context: &str, tiles: &[AppTile], sel: usize) -> usize {
     show_overview(
         context,
         &format!("{n} window{}", if n == 1 { "" } else { "s" }),
-        "← → choose   ↩ open   ⌃⌥↑ all contexts   esc close",
+        "← → choose   ⇧← → move   ↩ open   esc close",
         n,
         6,
         CGSize::new(164.0, 150.0),
