@@ -2752,6 +2752,8 @@ impl Wm {
             settle: true,
         });
         self.schedule_tick();
+        // The app it's heading for gets focus now, not when it arrives.
+        self.focus_main();
     }
 
     /// Slide the row (never resize) so `tiles[main]` is framed.

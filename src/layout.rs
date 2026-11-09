@@ -171,7 +171,7 @@ pub fn frame_scroll(
 
 /// How far the row coasts after a flick at `v` points a second: it slows
 /// down the way macOS scrolling does.
-pub const COAST_SECONDS: f64 = 0.325;
+pub const COAST_SECONDS: f64 = 0.55;
 
 /// How long (ms) the row takes to coast `d` points when it starts at `v`
 /// points a second, so it keeps the speed your fingers left it with and
@@ -182,7 +182,7 @@ pub fn coast_ms(d: f64, v: f64, rest: f64) -> f64 {
         return rest;
     }
     // An ease-out cubic starts at 3·d/T points a second.
-    (3.0 * d.abs() / v.abs() * 1000.0).clamp(rest, 700.0)
+    (3.0 * d.abs() / v.abs() * 1000.0).clamp(rest, 520.0)
 }
 
 /// Does the union of `rects` cover the whole screen? Sampled on a 10 × 10 grid,
@@ -361,12 +361,12 @@ mod tests {
 
     #[test]
     fn a_flick_keeps_its_speed_into_the_coast() {
-        // 600 pt to go at 3000 pt/s: 3·600/3000 = 0.6 s.
-        assert_eq!(coast_ms(600.0, 3000.0, 180.0), 600.0);
-        assert_eq!(coast_ms(-600.0, -3000.0, 180.0), 600.0);
+        // 400 pt to go at 3000 pt/s: 3·400/3000 = 0.4 s.
+        assert_eq!(coast_ms(400.0, 3000.0, 180.0), 400.0);
+        assert_eq!(coast_ms(-400.0, -3000.0, 180.0), 400.0);
         // Never faster than a normal glide, never dragging on.
         assert_eq!(coast_ms(20.0, 3000.0, 180.0), 180.0);
-        assert_eq!(coast_ms(2000.0, 300.0, 180.0), 700.0);
+        assert_eq!(coast_ms(2000.0, 300.0, 180.0), 520.0);
         // No speed, or the resting place is behind: a normal glide.
         assert_eq!(coast_ms(300.0, 0.0, 180.0), 180.0);
         assert_eq!(coast_ms(300.0, -900.0, 180.0), 180.0);
