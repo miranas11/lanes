@@ -550,7 +550,7 @@ unsafe extern "C-unwind" fn on_ax_note(
         | "AXUIElementDestroyed"
         | "AXWindowMiniaturized"
         | "AXWindowDeminiaturized" => Cmd::AppChanged(pid),
-        "AXFocusedWindowChanged" => Cmd::FocusChanged(pid),
+        "AXFocusedWindowChanged" | "AXMainWindowChanged" => Cmd::FocusChanged(pid),
         "AXWindowResized" => match ax::window_id(unsafe { el.as_ref() }) {
             Some(id) => Cmd::Resized(id),
             None => return,
@@ -708,6 +708,8 @@ impl Wm {
         let Some(obs) = &app.observer else { return };
         let refcon = pid as isize as *mut c_void;
         app.observing = ax::names(|n| {
+            // Switching tabs only changes the main window (each tab is a window).
+            obs.add(&app.el, &n.n_main_window_changed, refcon);
             obs.add(&app.el, &n.n_window_created, refcon)
                 && obs.add(&app.el, &n.n_focused_window_changed, refcon)
         });
@@ -721,6 +723,10 @@ impl Wm {
         };
         let mut seen = HashSet::new();
         let mut changed = false;
+        // Windows that just showed up and ones that just dropped out: in the
+        // same refresh, that's a tab switch (each tab is its own window).
+        let mut appeared: Vec<u32> = Vec::new();
+        let mut gone: Vec<(u32, bool)> = Vec::new();
         for el in ax::windows(&app_el) {
             let Some(id) = ax::window_id(&el) else {
                 continue;
@@ -745,6 +751,7 @@ impl Wm {
                     w.present = true;
                     w.applied = None;
                     changed = true;
+                    appeared.push(id);
                 }
                 if flip {
                     self.set_away(id, fullscreen);
@@ -764,6 +771,9 @@ impl Wm {
                 }
             }
             self.adopt(pid, id, el);
+            if !self.booting && self.wins.contains_key(&id) {
+                appeared.push(id);
+            }
             changed = true;
         }
         let missing: Vec<u32> = self
@@ -793,10 +803,23 @@ impl Wm {
                 if w.present {
                     w.present = false;
                     changed = true;
+                    gone.push((id, true));
                 }
+            } else if w.present {
+                gone.push((id, false));
+                changed = true;
             } else {
                 self.remove_window(id);
                 changed = true;
+            }
+        }
+        for (old, alive) in gone {
+            if !appeared.is_empty() {
+                let new = appeared.remove(0);
+                self.take_slot(new, old);
+            }
+            if !alive {
+                self.remove_window(old);
             }
         }
         if changed {
@@ -804,6 +827,56 @@ impl Wm {
             self.save_needed = true;
         }
         changed
+    }
+
+    /// Window `new` replaces `old` in the row: same spot, width, screen and
+    /// focus. Used when an app swaps one window for another in place, as a
+    /// tab switch does (Terminal, Finder and others give each tab a window).
+    fn take_slot(&mut self, new: u32, old: u32) {
+        let Some(o) = self.wins.get_mut(&old) else {
+            return;
+        };
+        let (ctx, frac, area, left_area, full_prev, min_w) =
+            (o.ctx, o.frac, o.area, o.left_area, o.full_prev, o.min_w);
+        // The hidden tab gives up its screen; it gets one back if it returns.
+        o.area = None;
+        o.left_area = None;
+        let cur = self.cur;
+        for (i, c) in self.ctxs.iter_mut().enumerate() {
+            c.order.retain(|&x| x != new);
+            if i != ctx && c.focus == Some(new) {
+                c.focus = None;
+            }
+        }
+        let c = &mut self.ctxs[ctx];
+        let at = c
+            .order
+            .iter()
+            .position(|&x| x == old)
+            .unwrap_or(c.order.len());
+        c.order.insert(at, new);
+        if c.focus == Some(old) {
+            c.focus = Some(new);
+        }
+        let Some(n) = self.wins.get_mut(&new) else {
+            return;
+        };
+        n.ctx = ctx;
+        n.frac = frac;
+        n.area = area;
+        n.left_area = left_area;
+        n.full_prev = full_prev;
+        n.min_w = min_w;
+        n.applied = None;
+        if let Some(t) = self.used.get(&old).copied() {
+            self.used.insert(new, t);
+        }
+        crate::log!("tab: window {new} takes the place of {old}");
+        if ctx == cur && self.ctxs[cur].focus == Some(new) {
+            self.ensure_visible(new);
+        }
+        self.layout_needed = true;
+        self.save_needed = true;
     }
 
     fn adopt(&mut self, pid: i32, id: u32, el: Elem) {
@@ -1153,7 +1226,10 @@ impl Wm {
     // ---------- focus ----------
 
     fn focus(&mut self, id: u32) {
-        let Some(w) = self.wins.get(&id) else { return };
+        // Raising a hidden tab's window would switch the app to that tab.
+        let Some(w) = self.wins.get(&id).filter(|w| w.present) else {
+            return;
+        };
         let (pid, el, ctx) = (w.pid, w.el.clone(), w.ctx);
         let frontmost = self
             .apps
@@ -1232,7 +1308,7 @@ impl Wm {
             return;
         };
         let Some(id) = ax::window_id(&el) else { return };
-        if !self.wins.contains_key(&id) {
+        if self.wins.get(&id).is_none_or(|w| !w.present) {
             self.refresh_app(pid);
         }
         if self.wins.get(&id).is_some_and(|w| w.away) {
@@ -2517,7 +2593,8 @@ impl Wm {
     fn window_under(&self, x: f64, y: f64) -> Option<u32> {
         self.ctxs[self.cur].order.iter().copied().find(|id| {
             self.wins.get(id).is_some_and(|w| {
-                !w.parked
+                self.shown(w)
+                    && !w.parked
                     && !w.away
                     && w.applied
                         .is_some_and(|f| x >= f.x && x < f.x + f.w && y >= f.y && y < f.y + f.h)
