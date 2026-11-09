@@ -385,6 +385,10 @@ pub fn read_refresh_rate(mtm: MainThreadMarker) -> f64 {
     fps
 }
 
+pub fn cancel_scroll_end() {
+    cancel(sel!(scrollEnded:));
+}
+
 pub fn schedule_scroll_end() {
     debounce(sel!(scrollEnded:), 0.25);
 }

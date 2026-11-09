@@ -139,6 +139,34 @@ thread_local! {
     static OUTLINE_ON: Cell<bool> = const { Cell::new(false) };
     static TAP: RefCell<Option<CFRetained<CFMachPort>>> = const { RefCell::new(None) };
     static LAST_ROW_SCROLL: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// Recent ⌃⌥-scroll steps (event time in ns, points), for the speed
+    /// the row has when your fingers lift.
+    static STEPS: RefCell<Vec<(u64, f64)>> = const { RefCell::new(Vec::new()) };
+}
+
+// Trackpad scroll phases (kCGScrollPhase…).
+const PHASE_BEGAN: i64 = 1;
+const PHASE_ENDED: i64 = 4;
+const PHASE_CANCELLED: i64 = 8;
+const PHASE_MAY_BEGIN: i64 = 128;
+
+/// Points a second over the last tenth of a second of `steps`, as of `now`
+/// (ns). Zero when the fingers had already stopped before lifting.
+fn lift_speed(steps: &[(u64, f64)], now: u64) -> f64 {
+    let Some(&(last, _)) = steps.last() else {
+        return 0.0;
+    };
+    if now.saturating_sub(last) > 60_000_000 {
+        return 0.0;
+    }
+    let recent: Vec<&(u64, f64)> = steps
+        .iter()
+        .filter(|(t, _)| last - t <= 100_000_000)
+        .collect();
+    let sum: f64 = recent.iter().map(|(_, d)| d).sum();
+    // The first step covers the time since the one before it: about a frame.
+    let span = (last - recent[0].0) as f64 / 1e9 + 0.008;
+    sum / span
 }
 
 /// Creates the event tap on its own thread. Needs the Accessibility permission.
@@ -492,7 +520,33 @@ fn on_scroll(e: &CGEvent) -> bool {
     }
     let m = Mods::of(e);
     let now = Instant::now();
+    let momentum =
+        CGEvent::integer_value_field(Some(e), CGEventField::ScrollWheelEventMomentumPhase) != 0;
     if m.ctrl && m.alt && !m.cmd {
+        // The coasting after your fingers lift is Lanes' own (see Fling):
+        // macOS's version stops dead the moment the pointer moves.
+        if momentum {
+            LAST_ROW_SCROLL.set(Some(now));
+            return true;
+        }
+        let phase =
+            CGEvent::integer_value_field(Some(e), CGEventField::ScrollWheelEventScrollPhase);
+        let at = CGEvent::timestamp(Some(e));
+        if phase == PHASE_ENDED || phase == PHASE_CANCELLED {
+            let v = STEPS.with_borrow_mut(|s| {
+                let v = lift_speed(s, at);
+                s.clear();
+                v
+            });
+            wm::push(Cmd::Fling(if phase == PHASE_ENDED { v } else { 0.0 }));
+            LAST_ROW_SCROLL.set(Some(now));
+            return true;
+        }
+        if phase == PHASE_BEGAN || phase == PHASE_MAY_BEGIN {
+            // Fingers down: a coasting row stops under them.
+            STEPS.with_borrow_mut(Vec::clear);
+            wm::push(Cmd::Touch);
+        }
         let dy =
             CGEvent::integer_value_field(Some(e), CGEventField::ScrollWheelEventPointDeltaAxis1);
         let dx =
@@ -500,14 +554,20 @@ fn on_scroll(e: &CGEvent) -> bool {
         let d = if dx.abs() > dy.abs() { -dx } else { -dy };
         if d != 0 {
             wm::push(Cmd::Scroll(d as f64));
+            if phase != 0 {
+                STEPS.with_borrow_mut(|s| {
+                    if s.len() >= 32 {
+                        s.remove(0);
+                    }
+                    s.push((at, d as f64));
+                });
+            }
         }
         LAST_ROW_SCROLL.set(Some(now));
         return true;
     }
     // Keys released mid-glide: swallow the leftover momentum so the row stops
     // where you stopped and the app underneath doesn't suddenly scroll.
-    let momentum =
-        CGEvent::integer_value_field(Some(e), CGEventField::ScrollWheelEventMomentumPhase) != 0;
     if momentum
         && let Some(t) = LAST_ROW_SCROLL.get()
         && now.duration_since(t).as_millis() < 400
@@ -521,6 +581,17 @@ fn on_scroll(e: &CGEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_speed_at_lift_comes_from_the_last_steps() {
+        // 20 pt every 8 ms = 2500 pt/s.
+        let steps: Vec<(u64, f64)> = (0..10).map(|i| (i * 8_000_000, 20.0)).collect();
+        let v = lift_speed(&steps, 9 * 8_000_000 + 5_000_000);
+        assert!((v - 2500.0).abs() < 1.0, "{v}");
+        // Fingers rested before lifting: no flick.
+        assert_eq!(lift_speed(&steps, 9 * 8_000_000 + 200_000_000), 0.0);
+        assert_eq!(lift_speed(&[], 0), 0.0);
+    }
 
     #[test]
     fn number_row_maps_to_contexts() {

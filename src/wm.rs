@@ -68,6 +68,10 @@ pub enum Cmd {
     OvClose,
     OvPick(usize),
     Scroll(f64),
+    /// Fingers lifted from a ⌃⌥-scroll at this speed (points a second).
+    Fling(f64),
+    /// Fingers touched the trackpad with ⌃⌥ held.
+    Touch,
     ScrollEnd,
     AppChanged(i32),
     FocusChanged(i32),
@@ -546,6 +550,10 @@ struct Glide {
     /// Set on the first frame, not when asked: focusing a window can block
     /// for ~100 ms, and starting the clock early would skip most of the glide.
     start: Option<Instant>,
+    /// How long it takes, in ms.
+    ms: f64,
+    /// It ends a scroll: the app it lands on gets focus.
+    settle: bool,
 }
 
 /// How long a glide takes. Short enough to feel instant, long enough to follow.
@@ -2326,6 +2334,8 @@ impl Wm {
         if !matches!(
             c,
             Cmd::Scroll(_)
+                | Cmd::Fling(_)
+                | Cmd::Touch
                 | Cmd::ScrollEnd
                 | Cmd::AppChanged(_)
                 | Cmd::FocusChanged(_)
@@ -2352,6 +2362,8 @@ impl Wm {
             | Cmd::Center
             | Cmd::FullView
             | Cmd::Scroll(_)
+            | Cmd::Fling(_)
+            | Cmd::Touch
                 if overlay_open =>
             {
                 return;
@@ -2507,6 +2519,16 @@ impl Wm {
                 self.dots_needed = true;
                 ui::schedule_scroll_end();
             }
+            Cmd::Fling(v) => self.fling(v),
+            Cmd::Touch => {
+                // A coasting row stops under your fingers; lifting them
+                // again (or scrolling on) settles it.
+                if self.anim.is_some_and(|g| g.settle) {
+                    self.anim = None;
+                    self.scrolling = true;
+                    ui::schedule_scroll_end();
+                }
+            }
             Cmd::ScrollEnd => {
                 self.scrolling = false;
                 self.after_scroll();
@@ -2642,14 +2664,22 @@ impl Wm {
     /// When you let go after ⌃⌥-scrolling: the most visible app becomes the
     /// main one, gets focus, and the row slides so it's framed (no slivers).
     fn after_scroll(&mut self) {
-        let usable = self.usable();
         let (tiles, _) = self.tiles(self.cur);
         if tiles.is_empty() {
             return;
         }
         let scroll = self.ctxs[self.cur].scroll;
+        let main = self.main_tile(&tiles, scroll);
+        self.frame(&tiles, main);
+        self.focus_main();
+    }
+
+    /// The stop that shows the most with the row at `scroll` (the focused
+    /// one on a tie).
+    fn main_tile(&self, tiles: &[Tile], scroll: f64) -> usize {
+        let usable = self.usable();
         let focus = self.ctxs[self.cur].focus;
-        let main = (0..tiles.len())
+        (0..tiles.len())
             .max_by(|&a, &b| {
                 let key = |i: usize| {
                     let t = &tiles[i];
@@ -2660,12 +2690,68 @@ impl Wm {
                 };
                 key(a).cmp(&key(b))
             })
-            .unwrap_or(0);
-        self.frame(&tiles, main);
+            .unwrap_or(0)
+    }
+
+    /// Give focus to the app the row is resting on (or heading for), unless
+    /// it already has it.
+    fn focus_main(&mut self) {
+        let (tiles, _) = self.tiles(self.cur);
+        if tiles.is_empty() {
+            return;
+        }
+        let at = match self.anim {
+            Some(g) => g.to,
+            None => self.ctxs[self.cur].scroll,
+        };
+        let main = self.main_tile(&tiles, at);
+        let focus = self.ctxs[self.cur].focus;
         let has_focus = focus.is_some_and(|f| tiles[main].has(f));
         if !has_focus && let Some(&(id, _)) = tiles[main].ids.first() {
             self.focus(id);
         }
+    }
+
+    /// Fingers lifted at `v` points a second: the row coasts on by itself,
+    /// in one move, straight to a clean resting place near where that speed
+    /// would carry it (no stopping on a sliver and then correcting). Moving
+    /// the pointer doesn't interrupt it; scrolling again or a shortcut does.
+    fn fling(&mut self, v: f64) {
+        // Only a scroll can be flung (fingers resting on the trackpad while
+        // ⌃⌥ is held also "lift").
+        if !self.scrolling {
+            return;
+        }
+        self.scrolling = false;
+        ui::cancel_scroll_end();
+        let usable = self.usable();
+        let (tiles, total) = self.tiles(self.cur);
+        if tiles.is_empty() {
+            return;
+        }
+        let max = (total - usable).max(0.0);
+        let from = self.ctxs[self.cur].scroll.clamp(0.0, max);
+        let reach = (from + v * layout::COAST_SECONDS).clamp(0.0, max);
+        let main = self.main_tile(&tiles, reach);
+        let stops: Vec<(f64, f64)> = tiles.iter().map(|t| (t.off, t.w)).collect();
+        let sliver = (self.scr.w * 0.2).max(160.0);
+        let to = layout::frame_scroll(&stops, main, reach, usable, sliver);
+        self.layout_needed = true;
+        self.dots_needed = true;
+        if (to - from).abs() < 0.5 || !ui::smooth_gliding() {
+            self.anim = None;
+            self.ctxs[self.cur].scroll = to;
+            self.focus_main();
+            return;
+        }
+        self.anim = Some(Glide {
+            from,
+            to,
+            start: None,
+            ms: layout::coast_ms(to - from, v, GLIDE_MS),
+            settle: true,
+        });
+        self.schedule_tick();
     }
 
     /// Slide the row (never resize) so `tiles[main]` is framed.
@@ -2718,6 +2804,8 @@ impl Wm {
             from,
             to: target,
             start: None,
+            ms: GLIDE_MS,
+            settle: false,
         });
         self.schedule_tick();
     }
@@ -2738,12 +2826,15 @@ impl Wm {
         };
         let start = *g.start.get_or_insert_with(Instant::now);
         self.anim = Some(g);
-        let t = (start.elapsed().as_secs_f64() * 1000.0 / GLIDE_MS).min(1.0);
+        let t = (start.elapsed().as_secs_f64() * 1000.0 / g.ms).min(1.0);
         let eased = 1.0 - (1.0 - t).powi(3);
         self.ctxs[self.cur].scroll = g.from + (g.to - g.from) * eased;
         self.layout_needed = true;
         if t >= 1.0 {
             self.anim = None;
+            if g.settle {
+                self.focus_main();
+            }
         } else {
             self.schedule_tick();
         }

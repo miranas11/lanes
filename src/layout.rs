@@ -106,6 +106,9 @@ pub fn visible(off: f64, w: f64, s: f64, usable: f64) -> f64 {
     ((off + w).min(s + usable) - off.max(s)).max(0.0)
 }
 
+/// A resting place this close (points) to a lined-up one becomes it.
+const MAGNET: f64 = 40.0;
+
 /// Where the row should rest when scrolling stops. Only when some stop shows
 /// just a thin sliver (less than `sliver` points) does the row slide, by the
 /// smallest amount that lines a stop up with a screen edge and leaves no
@@ -129,16 +132,24 @@ pub fn frame_scroll(
             v <= 0.5 || v >= w - 1.0 || v >= sliver
         })
     };
-    if good(scroll) {
-        return scroll.clamp(0.0, max_scroll);
-    }
-    // Candidate resting points: some stop's edge on a screen edge, or the
-    // main stop centred.
-    let mut cands = vec![mo + mw / 2.0 - usable / 2.0];
+    // Resting points where a stop's edge sits on a screen edge.
+    let mut cands = Vec::with_capacity(stops.len() * 2 + 1);
     for &(o, w) in stops {
         cands.push(o);
         cands.push(o + w - usable);
     }
+    if good(scroll) {
+        // Almost lined up is meant to be lined up: a few points off would
+        // leave an app shaved at the screen edge.
+        let near = cands
+            .iter()
+            .map(|c| c.clamp(0.0, max_scroll))
+            .filter(|c| (c - scroll).abs() <= MAGNET && good(*c))
+            .min_by(|a, b| (a - scroll).abs().total_cmp(&(b - scroll).abs()));
+        return near.unwrap_or(scroll.clamp(0.0, max_scroll));
+    }
+    // Otherwise also consider the main stop centred.
+    cands.push(mo + mw / 2.0 - usable / 2.0);
     let mut best: Option<f64> = None;
     for c in cands {
         let c = c.clamp(0.0, max_scroll);
@@ -156,6 +167,22 @@ pub fn frame_scroll(
             right
         }
     })
+}
+
+/// How far the row coasts after a flick at `v` points a second: it slows
+/// down the way macOS scrolling does.
+pub const COAST_SECONDS: f64 = 0.325;
+
+/// How long (ms) the row takes to coast `d` points when it starts at `v`
+/// points a second, so it keeps the speed your fingers left it with and
+/// slows evenly into place. `rest` is the time used when there's no speed
+/// to carry (or the resting place is behind).
+pub fn coast_ms(d: f64, v: f64, rest: f64) -> f64 {
+    if d * v <= 0.0 || v.abs() < 1.0 {
+        return rest;
+    }
+    // An ease-out cubic starts at 3·d/T points a second.
+    (3.0 * d.abs() / v.abs() * 1000.0).clamp(rest, 700.0)
 }
 
 /// Does the union of `rects` cover the whole screen? Sampled on a 10 × 10 grid,
@@ -302,6 +329,15 @@ mod tests {
     }
 
     #[test]
+    fn almost_lined_up_snaps_into_line() {
+        // 4 pt past the second stop's edge: it would be shaved by 4 pt.
+        assert_eq!(frame_scroll(&HALVES, 1, 756.0, 1496.0, 300.0), 752.0);
+        assert_eq!(frame_scroll(&HALVES, 1, 730.0, 1496.0, 300.0), 752.0);
+        // Further away it's a deliberate position.
+        assert_eq!(frame_scroll(&HALVES, 1, 400.0, 1496.0, 300.0), 400.0);
+    }
+
+    #[test]
     fn a_full_width_main_app_is_shown_whole() {
         let full = [(0.0, 1496.0), (1504.0, 1496.0)];
         // 250 pt of the first one peeking in: frame the second.
@@ -321,6 +357,19 @@ mod tests {
         assert_eq!(nearest(&[true, true, true, false, true], 3), Some(4));
         assert_eq!(nearest(&[false, false], 0), None);
         assert_eq!(nearest(&[], 0), None);
+    }
+
+    #[test]
+    fn a_flick_keeps_its_speed_into_the_coast() {
+        // 600 pt to go at 3000 pt/s: 3·600/3000 = 0.6 s.
+        assert_eq!(coast_ms(600.0, 3000.0, 180.0), 600.0);
+        assert_eq!(coast_ms(-600.0, -3000.0, 180.0), 600.0);
+        // Never faster than a normal glide, never dragging on.
+        assert_eq!(coast_ms(20.0, 3000.0, 180.0), 180.0);
+        assert_eq!(coast_ms(2000.0, 300.0, 180.0), 700.0);
+        // No speed, or the resting place is behind: a normal glide.
+        assert_eq!(coast_ms(300.0, 0.0, 180.0), 180.0);
+        assert_eq!(coast_ms(300.0, -900.0, 180.0), 180.0);
     }
 
     #[test]
