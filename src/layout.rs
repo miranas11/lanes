@@ -189,6 +189,20 @@ pub fn member_frame(x: f64, y: f64, w: f64, h: f64, r: Rect, gap: f64) -> (f64, 
     (fx.round(), fy.round(), fw.round(), fh.round())
 }
 
+/// The usable slot nearest to `at` (itself not usable): the closer side
+/// wins, the right one on a tie. Used to pick the window that takes over
+/// when the focused one leaves the row.
+pub fn nearest(usable: &[bool], at: usize) -> Option<usize> {
+    let at = at.min(usable.len());
+    let right = usable[at..].iter().position(|u| *u).map(|d| at + d);
+    let left = usable[..at].iter().rposition(|u| *u);
+    match (left, right) {
+        (Some(l), Some(r)) if at - l < r - at => Some(l),
+        (_, Some(r)) => Some(r),
+        (l, None) => l,
+    }
+}
+
 /// One letter per app: its first letter, else the next free letter of its
 /// name, else the first free letter of the alphabet. The same names in the
 /// same order always get the same letters.
@@ -292,6 +306,21 @@ mod tests {
         let full = [(0.0, 1496.0), (1504.0, 1496.0)];
         // 250 pt of the first one peeking in: frame the second.
         assert_eq!(frame_scroll(&full, 1, 1254.0, 1496.0, 300.0), 1504.0);
+    }
+
+    #[test]
+    fn focus_moves_to_the_nearest_window_left_in_the_row() {
+        // The window at 2 left: its right neighbour takes over.
+        assert_eq!(nearest(&[true, true, false, true], 2), Some(3));
+        // Nothing to the right: the left neighbour.
+        assert_eq!(nearest(&[true, true, false], 2), Some(1));
+        // The closer side wins (hidden tabs sit in between).
+        assert_eq!(nearest(&[true, false, false, false, true], 1), Some(0));
+        assert_eq!(nearest(&[true, false, false, false, true], 3), Some(4));
+        // Never the far end of the row when a neighbour is there.
+        assert_eq!(nearest(&[true, true, true, false, true], 3), Some(4));
+        assert_eq!(nearest(&[false, false], 0), None);
+        assert_eq!(nearest(&[], 0), None);
     }
 
     #[test]

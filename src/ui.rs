@@ -6,7 +6,7 @@
 //! shown, so nothing is drawn while you work.
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, Sel};
@@ -61,7 +61,9 @@ const TAG_QUIT: isize = 31;
 const TAG_DESKTOPS: isize = 32;
 const TAG_LOG: isize = 33;
 const TAG_FOLLOW: isize = 34;
+const TAG_GLIDE: isize = 35;
 const FOLLOW_OFF_KEY: &str = "focusFollowsMouseOff";
+const GLIDE_KEY: &str = "smoothGliding";
 
 define_class!(
     #[unsafe(super(NSObject))]
@@ -86,6 +88,17 @@ define_class!(
                     FOLLOW.store(on, Ordering::Relaxed);
                     let defaults = NSUserDefaults::standardUserDefaults();
                     defaults.setBool_forKey(!on, &NSString::from_str(FOLLOW_OFF_KEY));
+                    let (names, cur) = UI.with_borrow(|u| match u {
+                        Some(u) => (u.names.clone(), u.cur),
+                        None => (Vec::new(), 0),
+                    });
+                    rebuild_menu(&names, cur);
+                }
+                TAG_GLIDE => {
+                    let on = !smooth_gliding();
+                    GLIDE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                    let defaults = NSUserDefaults::standardUserDefaults();
+                    defaults.setBool_forKey(on, &NSString::from_str(GLIDE_KEY));
                     let (names, cur) = UI.with_borrow(|u| match u {
                         Some(u) => (u.names.clone(), u.cur),
                         None => (Vec::new(), 0),
@@ -264,11 +277,14 @@ struct Ui {
 
 /// Focus follows mouse; read by the input thread on every pointer move.
 static FOLLOW: AtomicBool = AtomicBool::new(true);
+/// Smooth gliding as chosen in the menu: 1 on, 2 off, 0 not chosen yet.
+static GLIDE: AtomicU8 = AtomicU8::new(0);
 
 thread_local! {
     static CTRL: OnceCell<Retained<Controller>> = const { OnceCell::new() };
     static UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
     static HOVER_AT: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
+    static FPS: Cell<f64> = const { Cell::new(60.0) };
 }
 
 fn ctrl() -> Option<Retained<Controller>> {
@@ -319,13 +335,26 @@ pub fn schedule_trust_poll() {
     debounce(sel!(trustPoll:), 1.0);
 }
 
-/// Next frame of a glide, about 60 times a second.
 /// Focus follows the mouse (on unless turned off in the menu).
 pub fn follow_mouse() -> bool {
     FOLLOW.load(Ordering::Relaxed)
 }
 
-/// The pointer moved: check what's under it once it has rested 0.15 s.
+/// Should the row glide to its place (or jump)? Your choice in the menu
+/// wins; until you make one, Lanes follows the system's Reduce Motion
+/// setting (LANES_SMOOTH=1 in the environment also turns gliding on).
+pub fn smooth_gliding() -> bool {
+    match GLIDE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            std::env::var_os("LANES_SMOOTH").is_some_and(|v| v == "1")
+                || !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+        }
+    }
+}
+
+/// The pointer entered a window: check what's under it after `delay`.
 pub fn schedule_hover_commit(x: f64, y: f64, delay: f64) {
     HOVER_AT.set((x, y));
     debounce(sel!(hoverCommit:), delay);
@@ -340,8 +369,20 @@ pub fn cancel_hover_commit() {
     cancel(sel!(hoverCommit:));
 }
 
+/// Next frame of a glide, at the display's own pace (120 a second on a
+/// ProMotion display, 60 otherwise).
 pub fn schedule_glide_tick() {
-    perform(sel!(glideTick:), None, 1.0 / 60.0);
+    perform(sel!(glideTick:), None, 1.0 / FPS.get());
+}
+
+/// Re-read the main display's refresh rate (at start and when displays change).
+pub fn read_refresh_rate(mtm: MainThreadMarker) -> f64 {
+    let fps = NSScreen::screens(mtm)
+        .firstObject()
+        .map_or(60, |s| s.maximumFramesPerSecond());
+    let fps = (fps as f64).clamp(60.0, 120.0);
+    FPS.set(fps);
+    fps
 }
 
 pub fn schedule_scroll_end() {
@@ -401,6 +442,12 @@ pub fn init(mtm: MainThreadMarker) {
     let off =
         NSUserDefaults::standardUserDefaults().boolForKey(&NSString::from_str(FOLLOW_OFF_KEY));
     FOLLOW.store(!off, Ordering::Relaxed);
+    let defaults = NSUserDefaults::standardUserDefaults();
+    let glide_key = NSString::from_str(GLIDE_KEY);
+    if defaults.objectForKey(&glide_key).is_some() {
+        let on = defaults.boolForKey(&glide_key);
+        GLIDE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+    }
     let c = Controller::new(mtm);
     CTRL.with(|cell| {
         let _ = cell.set(c);
@@ -629,6 +676,19 @@ pub fn rebuild_menu(names: &[String], cur: usize) {
             NSControlStateValueOff
         });
         menu.addItem(&follow);
+        let glide = menu_item(
+            mtm,
+            "Smooth Gliding",
+            TAG_GLIDE,
+            "",
+            NSEventModifierFlags::empty(),
+        );
+        glide.setState(if smooth_gliding() {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
+        menu.addItem(&glide);
         menu.addItem(&menu_item(
             mtm,
             "Show Log",

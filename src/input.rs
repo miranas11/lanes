@@ -207,6 +207,12 @@ unsafe extern "C-unwind" fn callback(
                 CGEvent::tap_enable(port, true);
             }
         });
+        // Key releases may have been missed meanwhile: start clean.
+        reset_arrows();
+        SWALLOW_UP.set(0);
+        if OUTLINE_ON.replace(false) {
+            wm::push(Cmd::Outline(false));
+        }
         return event.as_ptr();
     }
     let e = unsafe { event.as_ref() };
@@ -391,6 +397,9 @@ fn on_key(e: &CGEvent) -> bool {
                 }
                 return true;
             }
+            // Anything else: the overview gets out of the way and the key
+            // does its normal job (typing never goes on behind an overview).
+            wm::push(Cmd::OvClose);
             false
         }
         Mode::Normal => {

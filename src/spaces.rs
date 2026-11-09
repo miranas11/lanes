@@ -45,6 +45,26 @@ pub fn onscreen_windows() -> Vec<(u32, i32)> {
     out
 }
 
+/// Is a menu of app `pid` open (menu bar menu, context menu, pop-up list)?
+/// One WindowServer query, no call into the app.
+pub fn menu_open(pid: i32) -> bool {
+    const ON_SCREEN_ONLY: u32 = 1 << 0;
+    /// The window level menus are shown at (NSPopUpMenuWindowLevel).
+    const MENU_LAYER: i64 = 101;
+    let raw = unsafe { CGWindowListCopyWindowInfo(ON_SCREEN_ONLY, 0) };
+    let Some(list) = (unsafe { Retained::from_raw(raw) }) else {
+        return false;
+    };
+    let num = |obj: &AnyObject, key: &str| -> Option<i64> {
+        let v = get(obj, key)?;
+        Some(unsafe { msg_send![&*v, longLongValue] })
+    };
+    (0..count(&list)).filter_map(|i| at(&list, i)).any(|w| {
+        num(&w, "kCGWindowLayer") == Some(MENU_LAYER)
+            && num(&w, "kCGWindowOwnerPID") == Some(pid as i64)
+    })
+}
+
 pub struct Desktops {
     /// Regular desktops on the main display.
     pub desktops: usize,
@@ -110,9 +130,7 @@ mod scan_tests {
     fn lists_onscreen_windows() {
         let w = super::onscreen_windows();
         println!("onscreen windows: {}", w.len());
-        assert!(
-            w.iter().any(|(id, _)| *id == 37820),
-            "WhatsApp window not seen"
-        );
+        assert!(!w.is_empty(), "no windows seen");
+        assert!(w.iter().all(|(id, pid)| *id != 0 && *pid > 0));
     }
 }

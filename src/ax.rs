@@ -96,6 +96,13 @@ pub fn trusted(prompt: bool) -> bool {
     unsafe { AXIsProcessTrustedWithOptions(Some(dict)) }
 }
 
+/// Cap how long any Accessibility call may wait for an app (the default is
+/// several seconds per call, which a frozen app would make Lanes sit through).
+pub fn limit_waiting() {
+    let system = unsafe { AXUIElement::new_system_wide() };
+    unsafe { system.set_messaging_timeout(1.0) };
+}
+
 pub fn app_element(pid: i32) -> Elem {
     let el = unsafe { AXUIElement::new_application(pid) };
     // Never let a frozen app freeze us for long.
@@ -173,15 +180,20 @@ pub fn size_settable(el: &AXUIElement) -> bool {
     err != AXError::Success || settable != 0
 }
 
-pub fn windows(app: &AXUIElement) -> Vec<Elem> {
-    let Ok(v) = names(|n| copy(app, &n.windows)) else {
-        return Vec::new();
+/// The app's windows. None when the app didn't answer (busy or frozen):
+/// that says nothing about its windows, so callers must not treat it as
+/// "no windows".
+pub fn windows(app: &AXUIElement) -> Option<Vec<Elem>> {
+    let v = match names(|n| copy(app, &n.windows)) {
+        Ok(v) => v,
+        Err(AXError::CannotComplete) => return None,
+        Err(_) => return Some(Vec::new()),
     };
     let Ok(arr) = v.downcast::<CFArray>() else {
-        return Vec::new();
+        return Some(Vec::new());
     };
     let arr: CFRetained<CFArray<AXUIElement>> = unsafe { CFRetained::cast_unchecked(arr) };
-    arr.to_vec()
+    Some(arr.to_vec())
 }
 
 pub fn focused_window(app: &AXUIElement) -> Option<Elem> {

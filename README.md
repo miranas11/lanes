@@ -7,7 +7,8 @@ A lightweight scrolling window manager for macOS, written in Rust.
 - **One row per context.** Windows sit side by side at full height. Slide through them with the
   keyboard, or hold ⌃⌥ and scroll.
 - **Native and light.** Apple's own controls and colours (follows Light/Dark mode and your accent
-  colour), no web view, one thread, about a 0.5 MB binary.
+  colour), no web view, about a 0.5 MB binary. Shortcuts and scrolling are read on their own
+  thread and each app's windows are moved on another, so a busy app never slows the pointer.
 
 ## Install
 
@@ -46,7 +47,10 @@ Every shortcut is ⌃⌥ (Control + Option) plus one key on the right side of th
 | ⌃⌥Y | Snap windows back into the row |
 | ⌃⌥Space | Arrange apps on one screen: arrows pick the area (one arrow = half, two = corner, ← → = full), then the app's letter. The window you're in goes first. ⌫ splits a screen back into separate windows |
 
-In an overview: arrows to choose, Return to open, Esc or a click outside to close.
+In an overview: arrows to choose, Return to open, Esc, any other key or a click outside to close.
+
+The row glides to its place. With the system's Reduce Motion setting on it jumps instead, unless
+you turn on **Smooth Gliding** in the menu bar menu.
 
 ## Contexts
 
@@ -60,6 +64,8 @@ Quit and reopen Lanes after saving. Which window belongs to which context is rem
 - Use one desktop (Space) per display; Lanes replaces Spaces with contexts.
 - Windows that can't be resized (Calculator, About boxes) sit in the row at their own width.
 - New windows join the context you're in, right after the focused window.
+- Focus follows the pointer (turn it off in the menu). It waits while a menu is open or while
+  you're in a dialog Lanes doesn't manage, so pointing elsewhere never closes or buries them.
 - Quitting Lanes (menu, ⌘Q in its menu, logout, or `kill`) brings every hidden window back on screen.
 
 ## Layout
@@ -67,8 +73,12 @@ Quit and reopen Lanes after saving. Which window belongs to which context is rem
 ```
 src/main.rs    startup, clean shutdown on signals
 src/wm.rs      contexts, the row, focus, overviews (the core)
-src/input.rs   one event tap for shortcuts and ⌃⌥-scroll
+src/layout.rs  geometry: where the row rests, areas of a screen (pure, unit-tested)
+src/mover.rs   one worker per app that moves its windows off the main thread
+src/input.rs   one event tap, on its own thread, for shortcuts and ⌃⌥-scroll
 src/ax.rs      Accessibility API helpers
+src/spaces.rs  desktops and on-screen windows, read from the window server
 src/ui.rs      menu bar, HUDs, position dots, overview panels
 src/store.rs   saved contexts and state
+src/log.rs     ~/Library/Logs/Lanes.log
 ```

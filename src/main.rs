@@ -40,6 +40,7 @@ fn main() {
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     ui::init(mtm);
     signals::install();
+    ax::limit_waiting();
     wm::boot(mtm);
     app.run();
 }

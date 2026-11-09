@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use objc2_core_foundation::CGPoint;
 
@@ -30,9 +31,6 @@ unsafe impl Send for SendElem {}
 struct Pending {
     /// window id → (element, where it goes), newest wins
     moves: HashMap<u32, (SendElem, CGPoint)>,
-    /// The app's element when its enhanced UI must be off while moving
-    /// (Chrome animates every move otherwise).
-    enhanced_app: Option<SendElem>,
     /// Bring this (app, window) to the front; newest wins.
     activate: Option<(SendElem, SendElem)>,
     quit: bool,
@@ -60,16 +58,17 @@ pub struct Lane(Arc<Shared>);
 impl Mover {
     /// `fallback(pid)` runs (from the worker) when Accessibility can't make the
     /// app active, so the main thread can ask AppKit instead.
-    pub fn new(pid: i32, fallback: Fallback) -> Option<Self> {
+    pub fn new(pid: i32, app: &Elem, fallback: Fallback) -> Option<Self> {
         let shared = Arc::new(Shared {
             pending: Mutex::new(Pending::default()),
             wake: Condvar::new(),
             busy: Mutex::new(()),
         });
         let s = shared.clone();
+        let app = SendElem(app.clone());
         std::thread::Builder::new()
             .name(format!("lanes-mover-{pid}"))
-            .spawn(move || run(&s, pid, fallback))
+            .spawn(move || run(&s, pid, &app, fallback))
             .ok()?;
         Some(Self { shared })
     }
@@ -81,10 +80,9 @@ impl Mover {
 
 impl Lane {
     /// Queue a move; replaces any not-yet-applied move of the same window.
-    pub fn move_to(&self, id: u32, el: &Elem, p: CGPoint, enhanced_app: Option<&Elem>) {
+    pub fn move_to(&self, id: u32, el: &Elem, p: CGPoint) {
         if let Ok(mut q) = self.0.pending.lock() {
             q.moves.insert(id, (SendElem(el.clone()), p));
-            q.enhanced_app = enhanced_app.map(|a| SendElem(a.clone()));
         }
         self.0.wake.notify_one();
     }
@@ -125,7 +123,13 @@ impl Drop for Mover {
     }
 }
 
-fn run(s: &Shared, pid: i32, fallback: Fallback) {
+fn run(s: &Shared, pid: i32, app: &SendElem, fallback: Fallback) {
+    // Apps like Chrome turn on an accessibility mode that animates every move
+    // (windows slide across the screen), so it is switched off around moves.
+    // The flag is read here, never while a move is in flight: read at the
+    // wrong moment it looks off, and the next moves would be animated.
+    let mut enhanced = false;
+    let mut checked: Option<Instant> = None;
     loop {
         // Sleep until there's work, without holding `busy`.
         {
@@ -144,35 +148,38 @@ fn run(s: &Shared, pid: i32, fallback: Fallback) {
         // taking a move and applying it. (Lock order: busy, then pending;
         // `exclusive` never holds pending while waiting for busy.)
         let Ok(busy) = s.busy.lock() else { return };
-        let (moves, enhanced, activate) = {
+        let (moves, activate) = {
             let Ok(mut q) = s.pending.lock() else { return };
             if q.quit {
                 return;
             }
-            (
-                std::mem::take(&mut q.moves),
-                q.enhanced_app.take(),
-                q.activate.take(),
-            )
+            (std::mem::take(&mut q.moves), q.activate.take())
         };
         if !moves.is_empty() {
-            if let Some(a) = &enhanced {
-                ax::names(|n| ax::set_bool(&a.0, &n.enhanced_ui, false));
+            if checked.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
+                enhanced = ax::names(|n| ax::get_bool(&app.0, &n.enhanced_ui)).unwrap_or(false);
+                checked = Some(Instant::now());
+            }
+            if enhanced {
+                ax::names(|n| ax::set_bool(&app.0, &n.enhanced_ui, false));
             }
             for (_, (el, p)) in moves {
                 ax::set_point(&el.0, p);
             }
-            if let Some(a) = &enhanced {
-                ax::names(|n| ax::set_bool(&a.0, &n.enhanced_ui, true));
+            if enhanced {
+                ax::names(|n| ax::set_bool(&app.0, &n.enhanced_ui, true));
             }
         }
         if let Some((app, win)) = activate {
+            // The window first, then the app: the app comes forward already
+            // showing the right window, never another one of its windows
+            // (which may belong to a different context) for a moment.
+            ax::names(|n| ax::set_bool(&win.0, &n.main, true));
+            ax::raise(&win.0);
             let front = ax::names(|n| ax::set_bool(&app.0, &n.frontmost, true));
             if !front {
                 fallback(pid);
             }
-            ax::names(|n| ax::set_bool(&win.0, &n.main, true));
-            ax::raise(&win.0);
         }
         drop(busy);
     }

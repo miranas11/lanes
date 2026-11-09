@@ -101,7 +101,7 @@ fn parse(
             pid: pid.parse().ok()?,
             app: app.to_string(),
             ctx: ctx.parse().ok()?,
-            frac: frac.parse().ok()?,
+            frac: frac.parse().ok().filter(|f: &f64| f.is_finite())?,
             order: order.parse().ok()?,
             area,
         },

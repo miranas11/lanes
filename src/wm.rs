@@ -300,6 +300,7 @@ fn start(mtm: MainThreadMarker) {
         }
     });
     ui::rebuild_menu(&names, cur);
+    crate::log!("display: {:.0} frames a second", ui::read_refresh_rate(mtm));
     ui::observe_workspace();
     if input::install() {
         set_mode(Mode::Normal);
@@ -381,6 +382,8 @@ struct Win {
     /// Its spot in a screen while ⌃⌥Return has it full width, so a second
     /// ⌃⌥Return puts it back.
     left_area: Option<Area>,
+    /// Its place in the saved row, for windows that show up after start.
+    rank: Option<usize>,
 }
 
 /// A window's spot inside a screen (several windows sharing one stop in the row).
@@ -417,6 +420,7 @@ struct AppEntry {
     /// Apps like Chrome turn on an accessibility mode that animates every
     /// move (windows slide across the screen). Lanes turns it off around its
     /// own moves; the flag is re-read every few seconds since apps change it.
+    /// (This copy is for resizes; the app's mover keeps its own for moves.)
     enhanced_ui: bool,
     enhanced_checked: Instant,
     /// Clicking the desktop activates Finder; never treat that as crossing the wall.
@@ -520,6 +524,18 @@ struct Wm {
     outline: bool,
     /// The placed window the pointer is over (by geometry).
     hover: Option<u32>,
+    /// An app that became active while the row was moving; looked at once
+    /// the row is still, so asking the app doesn't make the glide stutter.
+    focus_pending: Option<i32>,
+    /// Apps whose windows changed while the row was moving (same reason).
+    refresh_pending: Vec<i32>,
+    /// A glide frame is already on its way.
+    tick_scheduled: bool,
+    /// You're in a window Lanes doesn't manage (a dialog, a floating panel):
+    /// pointing at the row must not bury it.
+    floating_front: bool,
+    /// When `ignored` was last emptied, so skipped windows get another look.
+    ignored_at: Instant,
 }
 
 /// The row gliding from one scroll position to another.
@@ -663,6 +679,11 @@ impl Wm {
             anim: None,
             outline: false,
             hover: None,
+            focus_pending: None,
+            refresh_pending: Vec::new(),
+            tick_scheduled: false,
+            floating_front: false,
+            ignored_at: Instant::now(),
         }
     }
 
@@ -741,6 +762,7 @@ impl Wm {
         let el = ax::app_element(pid);
         let enhanced_ui = ax::names(|n| ax::get_bool(&el, &n.enhanced_ui)).unwrap_or(false);
         let observer = ax::Observer::new(pid, Some(on_ax_note));
+        let mover = Mover::new(pid, &el, |pid| push(Cmd::ActivateApp(pid)));
         self.apps.insert(
             pid,
             AppEntry {
@@ -752,7 +774,7 @@ impl Wm {
                 enhanced_ui,
                 enhanced_checked: Instant::now(),
                 is_finder,
-                mover: Mover::new(pid, |pid| push(Cmd::ActivateApp(pid))),
+                mover,
             },
         );
         self.observe_app(pid);
@@ -788,18 +810,29 @@ impl Wm {
         // same refresh, that's a tab switch (each tab is its own window).
         let mut appeared: Vec<u32> = Vec::new();
         let mut gone: Vec<(u32, bool)> = Vec::new();
-        for el in ax::windows(&app_el) {
+        // A busy app that doesn't answer keeps its windows where they are
+        // (dropping them would collapse the row until it answers again).
+        let Some(list) = ax::windows(&app_el) else {
+            return false;
+        };
+        let lost_before = self.wins.len();
+        for el in list {
             let Some(id) = ax::window_id(&el) else {
                 continue;
             };
-            let (subrole, minimized, fullscreen) = ax::names(|n| {
+            // Asked one at a time: most of Chrome's "windows" are toolbars
+            // and pop-ups, ruled out by the first answer.
+            let subrole = ax::names(|n| ax::get_string(&el, &n.subrole));
+            if subrole.as_deref() != Some("AXStandardWindow") {
+                continue;
+            }
+            let (minimized, fullscreen) = ax::names(|n| {
                 (
-                    ax::get_string(&el, &n.subrole),
                     ax::get_bool(&el, &n.minimized).unwrap_or(false),
                     ax::get_bool(&el, &n.fullscreen).unwrap_or(false),
                 )
             });
-            if subrole.as_deref() != Some("AXStandardWindow") || minimized {
+            if minimized {
                 continue;
             }
             if fullscreen && !self.wins.contains_key(&id) {
@@ -873,6 +906,11 @@ impl Wm {
                 self.remove_window(id);
                 changed = true;
             }
+        }
+        if !gone.is_empty() || self.wins.len() < lost_before {
+            // A window closed or was minimised: macOS picks another app to
+            // make active, maybe one from another context. Not your doing.
+            self.quiet_until = Instant::now() + Duration::from_millis(700);
         }
         for (old, alive) in gone {
             if !appeared.is_empty() {
@@ -1000,12 +1038,33 @@ impl Wm {
                 size,
                 area,
                 left_area: None,
+                rank: saved.as_ref().map(|s| s.order),
             },
         );
 
         if self.booting {
             let key = saved.map(|s| s.order as f64).unwrap_or(1.0e6 + pos.x);
             self.boot_pending.push((id, ctx, key));
+            return;
+        }
+        if let Some(rank) = saved.map(|s| s.order) {
+            // A saved window that shows up after start (the Mac was locked,
+            // or its app was slow): back to its place in the row, quietly.
+            let front = self.frontmost_window() == Some(id);
+            let wins = &self.wins;
+            let c = &mut self.ctxs[ctx];
+            let at = c
+                .order
+                .iter()
+                .position(|x| wins.get(x).and_then(|w| w.rank).is_some_and(|r| r > rank))
+                .unwrap_or(c.order.len());
+            c.order.insert(at, id);
+            if c.focus.is_none() || front {
+                c.focus = Some(id);
+            }
+            if front && ctx == self.cur {
+                self.ensure_visible(id);
+            }
             return;
         }
         // A new window takes the spot right after the focused one and gets shown.
@@ -1172,7 +1231,9 @@ impl Wm {
         }
     }
 
-    /// The app's element if its enhanced UI is on (re-read every 2 s).
+    /// The app's element if its enhanced UI is on (re-read every 2 s). Only
+    /// call this while no mover can be mid-move for the app (it switches the
+    /// flag off while moving, which would read as "off" here).
     fn enhanced_app(&mut self, pid: i32) -> Option<Elem> {
         if let Some(a) = self.apps.get_mut(&pid)
             && a.enhanced_checked.elapsed() > Duration::from_secs(2)
@@ -1193,9 +1254,8 @@ impl Wm {
     /// Move a window without resizing it: handed to the app's mover, so it
     /// never blocks the main thread. Falls back to a direct call.
     fn move_async(&mut self, pid: i32, id: u32, el: &Elem, p: CGPoint) {
-        let enhanced = self.enhanced_app(pid);
         match self.lane(pid) {
-            Some(lane) => lane.move_to(id, el, p, enhanced.as_ref()),
+            Some(lane) => lane.move_to(id, el, p),
             None => self.with_enhanced_ui_off(pid, || {
                 ax::set_point(el, p);
             }),
@@ -1367,11 +1427,26 @@ impl Wm {
         self.used.insert(id, self.use_tick);
     }
 
+    /// The current context's focused window if it's in the row; otherwise
+    /// the window nearest to where it was (it was closed, minimised or
+    /// hidden), so focus never jumps to the far end of the row.
+    fn usable_focus(&self) -> Option<u32> {
+        let c = &self.ctxs[self.cur];
+        let ok = |id: &u32| self.wins.get(id).is_some_and(|w| self.shown(w));
+        let at = match c.focus {
+            Some(f) if ok(&f) => return Some(f),
+            Some(f) => c.order.iter().position(|&x| x == f),
+            None => None,
+        };
+        let Some(at) = at else {
+            return c.order.iter().copied().find(|id| ok(id));
+        };
+        let usable: Vec<bool> = c.order.iter().map(ok).collect();
+        layout::nearest(&usable, at).map(|i| c.order[i])
+    }
+
     fn focus_current_or_self(&mut self) {
-        let f = self.ctxs[self.cur]
-            .focus
-            .filter(|f| self.wins.get(f).is_some_and(|w| w.present))
-            .or_else(|| self.row_ids().first().copied());
+        let f = self.usable_focus();
         match f {
             Some(f) => self.focus(f),
             None => ui::activate_self(self.mtm),
@@ -1386,12 +1461,11 @@ impl Wm {
         let pos = self.ctxs[self.cur]
             .focus
             .and_then(|f| ids.iter().position(|&x| x == f));
-        let j = match pos {
-            Some(i) => (i as i32 + d).clamp(0, ids.len() as i32 - 1) as usize,
-            None if d > 0 => 0,
-            None => ids.len() - 1,
+        let id = match pos {
+            Some(i) => ids[(i as i32 + d).clamp(0, ids.len() as i32 - 1) as usize],
+            // The focused window left the row: start from its neighbour.
+            None => self.usable_focus().unwrap_or(ids[0]),
         };
-        let id = ids[j];
         self.ctxs[self.cur].focus = Some(id);
         self.frame_window(id);
         self.layout();
@@ -1420,12 +1494,14 @@ impl Wm {
             return;
         };
         let Some(el) = ax::focused_window(&app_el) else {
+            self.floating_front = false;
             return;
         };
         let Some(id) = ax::window_id(&el) else { return };
         if self.wins.get(&id).is_none_or(|w| !w.present) {
             self.refresh_app(pid);
         }
+        self.floating_front = !self.wins.contains_key(&id) && self.on_main_display(&el);
         if self.wins.get(&id).is_some_and(|w| w.away) {
             self.check_away(id);
         }
@@ -1462,6 +1538,33 @@ impl Wm {
             &format!("{app} is in {}", self.ctxs[other].name),
             &format!("Press ⌃⌥{} to switch", other + 1),
         );
+    }
+
+    fn on_main_display(&self, el: &Elem) -> bool {
+        match (ax::get_point(el), ax::get_size(el)) {
+            (Some(p), Some(s)) => self.scr.overlaps(p, s),
+            _ => false,
+        }
+    }
+
+    /// Is the active window one Lanes doesn't manage, on this display?
+    fn front_is_floating(&self) -> bool {
+        let Some(app) = NSWorkspace::sharedWorkspace()
+            .frontmostApplication()
+            .and_then(|a| self.apps.get(&a.processIdentifier()))
+        else {
+            return false;
+        };
+        let Some(el) = ax::focused_window(&app.el) else {
+            return false;
+        };
+        ax::window_id(&el).is_some_and(|id| !self.wins.contains_key(&id))
+            && self.on_main_display(&el)
+    }
+
+    /// Is the row moving (a ⌃⌥-scroll or a glide)? Slow questions to apps wait.
+    fn moving(&self) -> bool {
+        self.scrolling || self.anim.is_some()
     }
 
     /// Is the current context's focused window still open, visible and alive?
@@ -1658,6 +1761,10 @@ impl Wm {
         self.close_overlay();
         match target {
             Some(Target::Window(id)) => {
+                // It may have closed while the overview was open.
+                if !self.wins.get(&id).is_some_and(|w| self.shown(w)) {
+                    return;
+                }
                 self.ctxs[self.cur].focus = Some(id);
                 self.ensure_visible(id);
                 self.layout();
@@ -1873,6 +1980,10 @@ impl Wm {
             } => (*group, *anchor, *area),
             _ => return,
         };
+        // It may have closed while the picker was open.
+        if !self.wins.contains_key(&id) {
+            return;
+        }
         let rect = AREAS[area];
         let g = group.unwrap_or_else(|| {
             self.next_group += 1;
@@ -2159,6 +2270,16 @@ impl Wm {
         for id in away {
             self.check_away(id);
         }
+        if self.floating_front {
+            // The dialog may have closed without a word from its app.
+            self.floating_front = self.front_is_floating();
+        }
+        // Windows skipped earlier (their app wasn't ready, say) get another
+        // look now and then.
+        if self.ignored_at.elapsed() > Duration::from_secs(30) {
+            self.ignored.clear();
+            self.ignored_at = Instant::now();
+        }
         let mut pids = Vec::new();
         for (id, pid) in crate::spaces::onscreen_windows() {
             // Known windows are skipped, unless Lanes lost track of one that's
@@ -2392,14 +2513,33 @@ impl Wm {
                 self.layout_needed = true;
             }
             Cmd::AppChanged(pid) => {
-                if self.apps.contains_key(&pid) {
+                if self.moving() {
+                    // Re-reading an app's windows takes several ms: after the glide.
+                    if !self.refresh_pending.contains(&pid) {
+                        self.refresh_pending.push(pid);
+                    }
+                } else if self.apps.contains_key(&pid) {
                     self.refresh_app(pid);
                 } else {
                     self.register_app(pid);
                 }
             }
-            Cmd::FocusChanged(pid) | Cmd::Activated(pid) => self.on_focus_event(pid),
-            Cmd::Scan => self.scan(),
+            Cmd::FocusChanged(pid) | Cmd::Activated(pid) => {
+                // Finding out which window is active means asking the app,
+                // which takes ~20 ms while it wakes up: mid-glide that's a
+                // visible hitch, so it waits until the row is still.
+                if self.moving() {
+                    self.focus_pending = Some(pid);
+                } else {
+                    self.on_focus_event(pid);
+                }
+            }
+            Cmd::Scan => {
+                // Runs again in 2 s; never worth a dropped frame.
+                if !self.moving() {
+                    self.scan();
+                }
+            }
             Cmd::PlaceStart => self.place_start(),
             Cmd::PlaceArea(i) => self.place_area(i),
             Cmd::PlaceKey(c) => self.place_key(c),
@@ -2455,6 +2595,8 @@ impl Wm {
                 ui::schedule_refresh(pid);
             }
             Cmd::AppTerminated(pid) => {
+                // macOS now picks another app to make active: not your doing.
+                self.quiet_until = Instant::now() + Duration::from_millis(700);
                 self.apps.remove(&pid);
                 let ids: Vec<u32> = self
                     .wins
@@ -2472,10 +2614,14 @@ impl Wm {
                 if let Some(a) = self.apps.get_mut(&pid) {
                     a.hidden = hidden;
                     self.layout_needed = true;
+                    if hidden {
+                        self.quiet_until = Instant::now() + Duration::from_millis(700);
+                    }
                 }
             }
             Cmd::ScreensChanged => {
                 self.scr = read_screen(self.mtm);
+                ui::read_refresh_rate(self.mtm);
                 for w in self.wins.values_mut() {
                     w.applied = None;
                     w.parked = false;
@@ -2561,28 +2707,32 @@ impl Wm {
             self.anim = None;
             return;
         }
-        // Respect Reduce Motion, unless LANES_SMOOTH=1 asks to glide anyway.
-        let reduce = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
-            && std::env::var_os("LANES_SMOOTH").is_none_or(|v| v != "1");
-        if reduce {
+        // Jump instead when gliding is off (the menu, or Reduce Motion).
+        if !ui::smooth_gliding() {
             self.anim = None;
             self.ctxs[self.cur].scroll = target;
             self.layout_needed = true;
             return;
         }
-        let was_gliding = self.anim.is_some();
         self.anim = Some(Glide {
             from,
             to: target,
             start: None,
         });
-        if !was_gliding {
+        self.schedule_tick();
+    }
+
+    /// Ask for the next glide frame, unless one is already on its way.
+    fn schedule_tick(&mut self) {
+        if !self.tick_scheduled {
+            self.tick_scheduled = true;
             ui::schedule_glide_tick();
         }
     }
 
     /// One frame of a glide: ease out (fast start, gentle landing).
     fn glide_tick(&mut self) {
+        self.tick_scheduled = false;
         let Some(mut g) = self.anim else {
             return;
         };
@@ -2595,7 +2745,7 @@ impl Wm {
         if t >= 1.0 {
             self.anim = None;
         } else {
-            ui::schedule_glide_tick();
+            self.schedule_tick();
         }
     }
 
@@ -2642,6 +2792,14 @@ impl Wm {
     fn on_resized(&mut self, id: u32) {
         // Going into or coming out of full screen resizes the window: that's
         // not you resizing it by hand.
+        // (While the row moves, the resizes are Lanes' own: don't ask the app.)
+        let ours = self
+            .wins
+            .get(&id)
+            .is_some_and(|w| !w.away && w.touched.elapsed() < Duration::from_millis(800));
+        if self.moving() && ours {
+            return;
+        }
         if self.check_away(id) {
             return;
         }
@@ -2684,6 +2842,24 @@ impl Wm {
         for _ in 0..3 {
             if self.layout_needed {
                 self.layout();
+            }
+        }
+        // The row is still again: catch up on what the apps did meanwhile.
+        if !self.moving() && (self.focus_pending.is_some() || !self.refresh_pending.is_empty()) {
+            for pid in std::mem::take(&mut self.refresh_pending) {
+                if self.apps.contains_key(&pid) {
+                    self.refresh_app(pid);
+                } else {
+                    self.register_app(pid);
+                }
+            }
+            if let Some(pid) = self.focus_pending.take() {
+                self.on_focus_event(pid);
+            }
+            for _ in 0..3 {
+                if self.layout_needed {
+                    self.layout();
+                }
             }
         }
         let t1 = Instant::now();
@@ -2778,7 +2954,22 @@ impl Wm {
         let Some(id) = self.window_under(x, y) else {
             return;
         };
-        if self.ctxs[self.cur].focus == Some(id) || ax::window_at(x, y) != Some(id) {
+        if self.ctxs[self.cur].focus == Some(id) {
+            return;
+        }
+        // Leave things alone while you're in a dialog Lanes doesn't manage
+        // (raising the row would bury it) or have a menu open (switching
+        // apps would close it). The pointer is asked about again on its
+        // next move.
+        let front = self.ctxs[self.cur]
+            .focus
+            .and_then(|f| self.wins.get(&f))
+            .map(|w| w.pid);
+        if self.floating_front || front.is_some_and(crate::spaces::menu_open) {
+            self.hover = None;
+            return;
+        }
+        if ax::window_at(x, y) != Some(id) {
             return;
         }
         self.ctxs[self.cur].focus = Some(id);
@@ -2795,7 +2986,7 @@ impl Wm {
             ui::hide_outline();
             return;
         };
-        if w.parked || !self.shown(w) {
+        if w.parked || w.away || !self.shown(w) {
             ui::hide_outline();
             return;
         }
