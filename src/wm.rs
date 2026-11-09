@@ -1,13 +1,16 @@
 //! The window manager: contexts, the scrolling row, focus and the overviews.
 //!
-//! Everything runs on the main thread. Input callbacks only `push` commands;
-//! `drain` handles them in one batch, so a burst of scroll events results in
-//! a single layout pass.
+//! The state lives on the main thread. The input thread only `push`es
+//! commands; `drain` handles them in one batch, so a burst of scroll events
+//! results in a single layout pass. Plain window moves are handed to
+//! per-app movers (see `mover`), so no app can hold up the row or input.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::ptr::NonNull;
+use std::ptr::{self, NonNull};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use objc2::MainThreadMarker;
@@ -20,6 +23,7 @@ use objc2_core_foundation::{CFString, CGPoint, CGRect, CGSize};
 
 use crate::ax::{self, Elem};
 use crate::layout::{self, AREA_NAMES, AREAS, Rect};
+use crate::mover::{Lane, Mover};
 use crate::store::{self, Saved};
 use crate::ui::{self, AppTile, ContextCard};
 
@@ -28,6 +32,7 @@ const MIN_TILE: f64 = 240.0;
 const PRESETS: [f64; 4] = [1.0 / 3.0, 0.5, 2.0 / 3.0, 1.0];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 pub enum Mode {
     Off,
     Normal,
@@ -55,6 +60,8 @@ pub enum Cmd {
     ZoomOut,
     ZoomIn,
     OvMove(i32, i32),
+    /// Make an app active through AppKit (when Accessibility couldn't).
+    ActivateApp(i32),
     /// Move the app selected in ⌃⌥O one stop left (-1) or right (1).
     OvCarry(i32),
     OvEnter,
@@ -94,24 +101,55 @@ pub enum Cmd {
 
 thread_local! {
     static WM: RefCell<Option<Wm>> = const { RefCell::new(None) };
-    static QUEUE: RefCell<Vec<Cmd>> = const { RefCell::new(Vec::new()) };
-    static MODE: Cell<Mode> = const { Cell::new(Mode::Off) };
-    static CTX_COUNT: Cell<usize> = const { Cell::new(0) };
     static QUIT: Cell<bool> = const { Cell::new(false) };
     static RESTORED: Cell<bool> = const { Cell::new(false) };
+    static PROFILE: bool = std::env::var_os("LANES_PROFILE").is_some();
+}
+
+// Shared with the input thread, which must never wait on window work.
+static QUEUE: Mutex<Vec<Cmd>> = Mutex::new(Vec::new());
+static DRAIN_PENDING: AtomicBool = AtomicBool::new(false);
+static MODE: AtomicU8 = AtomicU8::new(Mode::Off as u8);
+static CTX_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// What the keyboard and pointer mean right now (read by the input thread).
+fn set_mode(m: Mode) {
+    MODE.store(m as u8, Ordering::Relaxed);
 }
 
 pub fn mode() -> Mode {
-    MODE.get()
+    match MODE.load(Ordering::Relaxed) {
+        1 => Mode::Normal,
+        2 => Mode::Overview,
+        3 => Mode::PlaceMap,
+        4 => Mode::PlaceApps,
+        _ => Mode::Off,
+    }
 }
 
 pub fn context_count() -> usize {
-    CTX_COUNT.get()
+    CTX_COUNT.load(Ordering::Relaxed)
 }
 
-/// Queue a command and make sure a drain is scheduled. Cheap; safe from any callback.
+unsafe extern "C" {
+    static _dispatch_main_q: c_void;
+    fn dispatch_async_f(
+        queue: *const c_void,
+        context: *mut c_void,
+        work: extern "C" fn(*mut c_void),
+    );
+}
+
+extern "C" fn drain_on_main(_: *mut c_void) {
+    DRAIN_PENDING.store(false, Ordering::Release);
+    drain();
+}
+
+/// Queue a command and make sure a drain is scheduled on the main thread.
+/// Cheap and safe from any thread (the input thread calls it per event).
 pub fn push(c: Cmd) {
-    QUEUE.with_borrow_mut(|q| {
+    if let Ok(mut q) = QUEUE.lock() {
+        let q = &mut *q;
         if let Cmd::Scroll(d) = c
             && let Some(Cmd::Scroll(prev)) = q.last_mut()
         {
@@ -129,21 +167,29 @@ pub fn push(c: Cmd) {
             c,
             Cmd::AppChanged(_) | Cmd::FocusChanged(_) | Cmd::Activated(_) | Cmd::Resized(_)
         );
-        if dedupe && q.contains(&c) {
-            return;
+        if !(dedupe && q.contains(&c)) {
+            q.push(c);
         }
-        q.push(c);
-    });
-    ui::schedule_drain();
+    }
+    // The main dispatch queue also runs while menus are open.
+    if !DRAIN_PENDING.swap(true, Ordering::AcqRel) {
+        unsafe { dispatch_async_f(&raw const _dispatch_main_q, ptr::null_mut(), drain_on_main) };
+    }
 }
 
 /// Handle every queued command. Called from the run loop.
 pub fn drain() {
     loop {
-        let cmds = QUEUE.with_borrow_mut(std::mem::take);
+        let cmds = QUEUE
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default();
         if cmds.is_empty() {
             break;
         }
+        let t0 = Instant::now();
+        let n = cmds.len();
+        let first = format!("{:?}", cmds[0]);
         WM.with_borrow_mut(|w| {
             if let Some(w) = w {
                 for c in cmds {
@@ -152,6 +198,12 @@ pub fn drain() {
                 w.flush();
             }
         });
+        if PROFILE.with(|p| *p) {
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            if ms > 2.0 {
+                crate::log!("profile: drain {ms:.1} ms, {n} cmds, first {first}");
+            }
+        }
     }
     if QUIT.get() {
         ui::terminate();
@@ -211,7 +263,7 @@ pub fn trust_poll(mtm: MainThreadMarker) {
 fn start(mtm: MainThreadMarker) {
     let mut wm = Wm::new(mtm);
     wm.adopt_all();
-    CTX_COUNT.set(wm.ctxs.len());
+    CTX_COUNT.store(wm.ctxs.len(), Ordering::Relaxed);
     let names: Vec<String> = wm.ctxs.iter().map(|c| c.name.clone()).collect();
     let cur = wm.cur;
     WM.with_borrow_mut(|w| *w = Some(wm));
@@ -250,7 +302,7 @@ fn start(mtm: MainThreadMarker) {
     ui::rebuild_menu(&names, cur);
     ui::observe_workspace();
     if input::install() {
-        MODE.set(Mode::Normal);
+        set_mode(Mode::Normal);
     } else {
         crate::log!("event tap: FAILED to install");
         ui::notice_for(
@@ -369,6 +421,8 @@ struct AppEntry {
     enhanced_checked: Instant,
     /// Clicking the desktop activates Finder; never treat that as crossing the wall.
     is_finder: bool,
+    /// Moves this app's windows on its own thread.
+    mover: Option<Mover>,
 }
 
 struct Ctx {
@@ -537,6 +591,12 @@ fn snap_frac(f: f64) -> f64 {
         .unwrap_or(f)
 }
 
+fn activate_app(pid: i32) {
+    if let Some(r) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
+        r.activateWithOptions(NSApplicationActivationOptions::empty());
+    }
+}
+
 unsafe extern "C-unwind" fn on_ax_note(
     _obs: NonNull<AXObserver>,
     el: NonNull<AXUIElement>,
@@ -692,6 +752,7 @@ impl Wm {
                 enhanced_ui,
                 enhanced_checked: Instant::now(),
                 is_finder,
+                mover: Mover::new(pid, |pid| push(Cmd::ActivateApp(pid))),
             },
         );
         self.observe_app(pid);
@@ -1111,18 +1172,38 @@ impl Wm {
         }
     }
 
-    fn with_enhanced_ui_off(&mut self, pid: i32, f: impl FnOnce()) {
+    /// The app's element if its enhanced UI is on (re-read every 2 s).
+    fn enhanced_app(&mut self, pid: i32) -> Option<Elem> {
         if let Some(a) = self.apps.get_mut(&pid)
             && a.enhanced_checked.elapsed() > Duration::from_secs(2)
         {
             a.enhanced_ui = ax::names(|n| ax::get_bool(&a.el, &n.enhanced_ui)).unwrap_or(false);
             a.enhanced_checked = Instant::now();
         }
-        let app = self
-            .apps
+        self.apps
             .get(&pid)
             .filter(|a| a.enhanced_ui)
-            .map(|a| a.el.clone());
+            .map(|a| a.el.clone())
+    }
+
+    fn lane(&self, pid: i32) -> Option<Lane> {
+        self.apps.get(&pid)?.mover.as_ref().map(Mover::lane)
+    }
+
+    /// Move a window without resizing it: handed to the app's mover, so it
+    /// never blocks the main thread. Falls back to a direct call.
+    fn move_async(&mut self, pid: i32, id: u32, el: &Elem, p: CGPoint) {
+        let enhanced = self.enhanced_app(pid);
+        match self.lane(pid) {
+            Some(lane) => lane.move_to(id, el, p, enhanced.as_ref()),
+            None => self.with_enhanced_ui_off(pid, || {
+                ax::set_point(el, p);
+            }),
+        }
+    }
+
+    fn with_enhanced_ui_off(&mut self, pid: i32, f: impl FnOnce()) {
+        let app = self.enhanced_app(pid);
         if let Some(a) = &app {
             ax::names(|n| ax::set_bool(a, &n.enhanced_ui, false));
         }
@@ -1137,12 +1218,31 @@ impl Wm {
         if !w.parked && w.applied == Some(f) {
             return;
         }
-        let size_changed = w.parked
-            || w.applied
-                .is_none_or(|a| (a.w - f.w).abs() > 0.5 || (a.h - f.h).abs() > 0.5);
-        let el = w.el.clone();
+        // A parked window keeps the size Lanes last gave it (parking only
+        // moves it), so coming back on screen is usually just a move too.
+        let (cw, ch) = match w.applied {
+            Some(a) => (a.w, a.h),
+            None => (f64::NAN, f64::NAN),
+        };
+        let size_changed = !((cw - f.w).abs() <= 0.5 && (ch - f.h).abs() <= 0.5);
+        let (el, pid) = (w.el.clone(), w.pid);
+        if !size_changed {
+            // The common case while scrolling: just a move.
+            self.move_async(pid, id, &el, CGPoint::new(f.x, f.y));
+            if let Some(w) = self.wins.get_mut(&id) {
+                w.applied = Some(f);
+                w.parked = false;
+                w.touched = Instant::now();
+            }
+            return;
+        }
+        // Resizing needs the app's answer (it may refuse a size), so it runs
+        // here, after any queued move of this window is dropped or finished.
+        let lane = self.lane(pid);
+        let _turn = lane.as_ref().and_then(|l| l.exclusive(Some(id)));
         let mut actual = None;
-        self.with_enhanced_ui_off(w.pid, || {
+        let (t0, pid0) = (Instant::now(), pid);
+        self.with_enhanced_ui_off(pid, || {
             let size = CGSize::new(f.w, f.h);
             if size_changed {
                 ax::set_size(&el, size);
@@ -1154,6 +1254,17 @@ impl Wm {
                 actual = ax::get_size(&el);
             }
         });
+        if PROFILE.with(|p| *p) {
+            let name = self
+                .apps
+                .get(&pid0)
+                .map(|a| a.name.clone())
+                .unwrap_or_default();
+            crate::log!(
+                "profile:   place {name} {:.1} ms (resize {size_changed})",
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let Some(w) = self.wins.get_mut(&id) else {
             return;
         };
@@ -1184,13 +1295,12 @@ impl Wm {
             scr.park_right
         };
         let (el, pid) = (w.el.clone(), w.pid);
-        // Without this, Chrome would visibly slide across the screen to the corner.
-        self.with_enhanced_ui_off(pid, || {
-            ax::set_point(&el, CGPoint::new(x, scr.park_y));
-        });
+        // The mover turns enhanced UI off around it, or Chrome would visibly
+        // slide across the screen to the corner.
+        self.move_async(pid, id, &el, CGPoint::new(x, scr.park_y));
         if let Some(w) = self.wins.get_mut(&id) {
+            // `applied` keeps the size; `parked` says where it really is.
             w.parked = true;
-            w.applied = None;
         }
     }
 
@@ -1231,17 +1341,22 @@ impl Wm {
             return;
         };
         let (pid, el, ctx) = (w.pid, w.el.clone(), w.ctx);
-        let frontmost = self
-            .apps
-            .get(&pid)
-            .is_some_and(|app| ax::names(|n| ax::set_bool(&app.el, &n.frontmost, true)));
-        if !frontmost
-            && let Some(r) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
-        {
-            r.activateWithOptions(NSApplicationActivationOptions::empty());
+        // Waking an app up takes 20–70 ms: its worker does it, after any
+        // moves still queued for it, so the row keeps gliding meanwhile.
+        match (self.apps.get(&pid), self.lane(pid)) {
+            (Some(app), Some(lane)) => lane.activate(&app.el, &el),
+            _ => {
+                let frontmost = self
+                    .apps
+                    .get(&pid)
+                    .is_some_and(|app| ax::names(|n| ax::set_bool(&app.el, &n.frontmost, true)));
+                if !frontmost {
+                    activate_app(pid);
+                }
+                ax::names(|n| ax::set_bool(&el, &n.main, true));
+                ax::raise(&el);
+            }
         }
-        ax::names(|n| ax::set_bool(&el, &n.main, true));
-        ax::raise(&el);
         self.ctxs[ctx].focus = Some(id);
         self.touch(id);
     }
@@ -1392,7 +1507,7 @@ impl Wm {
             Overlay::None => {}
         }
         self.overlay = Overlay::None;
-        MODE.set(Mode::Normal);
+        set_mode(Mode::Normal);
     }
 
     fn show_apps(&mut self) {
@@ -1428,7 +1543,7 @@ impl Wm {
             .collect();
         let cols = ui::show_apps(&self.ctxs[self.cur].name, &tiles, sel);
         self.overlay = Overlay::Apps { sel, ids, cols };
-        MODE.set(Mode::Overview);
+        set_mode(Mode::Overview);
     }
 
     fn show_contexts(&mut self, sel: usize) {
@@ -1457,7 +1572,7 @@ impl Wm {
             .collect();
         let cols = ui::show_contexts(&cards, sel);
         self.overlay = Overlay::Contexts { sel, cols };
-        MODE.set(Mode::Overview);
+        set_mode(Mode::Overview);
     }
 
     fn overlay_move(&mut self, dx: i32, dy: i32) {
@@ -1638,7 +1753,7 @@ impl Wm {
             std::array::from_fn(|i| taken.iter().any(|r| layout::overlaps(*r, AREAS[i])));
         ui::hide_overview();
         ui::show_area_map(&title, &flags, !taken.is_empty(), lit);
-        MODE.set(Mode::PlaceMap);
+        set_mode(Mode::PlaceMap);
     }
 
     fn place_area(&mut self, i: usize) {
@@ -1728,7 +1843,7 @@ impl Wm {
                 cols,
             };
         }
-        MODE.set(Mode::PlaceApps);
+        set_mode(Mode::PlaceApps);
     }
 
     fn place_key(&mut self, c: char) {
@@ -1994,7 +2109,7 @@ impl Wm {
         };
         ui::hide_notice();
         ui::hide_overview();
-        MODE.set(Mode::Normal);
+        set_mode(Mode::Normal);
         let cur = self.cur;
         // Keep any window that opened meanwhile; drop any that closed.
         let mut order: Vec<u32> = snapshot
@@ -2249,6 +2364,7 @@ impl Wm {
             Cmd::OvMove(dx, dy) => self.overlay_move(dx, dy),
             Cmd::OvEnter => self.overlay_enter(),
             Cmd::OvCarry(d) => self.overlay_carry(d),
+            Cmd::ActivateApp(pid) => activate_app(pid),
             Cmd::OvPick(i) => {
                 match &mut self.overlay {
                     Overlay::Apps { sel, .. }
@@ -2564,13 +2680,23 @@ impl Wm {
     }
 
     fn flush(&mut self) {
+        let t0 = Instant::now();
         for _ in 0..3 {
             if self.layout_needed {
                 self.layout();
             }
         }
+        let t1 = Instant::now();
         if self.outline {
             self.update_outline();
+        }
+        let t2 = Instant::now();
+        if PROFILE.with(|p| *p) && t2.duration_since(t0).as_secs_f64() > 0.002 {
+            crate::log!(
+                "profile:   flush layout {:.1} ms, outline {:.1} ms",
+                t1.duration_since(t0).as_secs_f64() * 1000.0,
+                t2.duration_since(t1).as_secs_f64() * 1000.0
+            );
         }
         if self.dots_needed {
             self.dots_needed = false;
@@ -2719,6 +2845,13 @@ impl Wm {
 
     /// Bring every window fully back on screen (used when Lanes quits).
     fn restore_all(&mut self) {
+        // Cancel queued moves and wait for the movers, so nothing lands after this.
+        let lanes: Vec<Lane> = self
+            .apps
+            .values()
+            .filter_map(|a| a.mover.as_ref().map(Mover::lane))
+            .collect();
+        let _turns: Vec<_> = lanes.iter().filter_map(|l| l.exclusive(None)).collect();
         let scr = self.scr;
         let mut n = 0.0;
         let ids: Vec<u32> = self
@@ -2787,14 +2920,13 @@ mod tests {
     }
 
     #[test]
-    fn scroll_commands_merge_in_the_queue() {
-        QUEUE.with_borrow_mut(|q| q.clear());
-        QUEUE.with_borrow_mut(|q| {
-            q.push(Cmd::Scroll(10.0));
-            if let Some(Cmd::Scroll(p)) = q.last_mut() {
-                *p += 5.0;
-            }
-        });
-        assert_eq!(QUEUE.with_borrow(|q| q.clone()), vec![Cmd::Scroll(15.0)]);
+    fn scroll_and_pointer_commands_merge_in_the_queue() {
+        QUEUE.lock().unwrap().clear();
+        push(Cmd::Scroll(10.0));
+        push(Cmd::Scroll(5.0));
+        push(Cmd::Pointer(1.0, 1.0));
+        push(Cmd::Pointer(2.0, 3.0));
+        let q = std::mem::take(&mut *QUEUE.lock().unwrap());
+        assert_eq!(q, vec![Cmd::Scroll(15.0), Cmd::Pointer(2.0, 3.0)]);
     }
 }

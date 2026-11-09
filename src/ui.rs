@@ -6,6 +6,7 @@
 //! shown, so nothing is drawn while you work.
 
 use std::cell::{Cell, OnceCell, RefCell};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, Sel};
@@ -69,12 +70,6 @@ define_class!(
     pub struct Controller;
 
     impl Controller {
-        #[unsafe(method(drain:))]
-        fn drain(&self, _o: Option<&AnyObject>) {
-            DRAIN_SCHEDULED.set(false);
-            wm::drain();
-        }
-
         #[unsafe(method(menuAction:))]
         fn menu_action(&self, sender: &NSMenuItem) {
             match sender.tag() {
@@ -88,7 +83,7 @@ define_class!(
                 TAG_LOG => open_log(),
                 TAG_FOLLOW => {
                     let on = !follow_mouse();
-                    FOLLOW.set(on);
+                    FOLLOW.store(on, Ordering::Relaxed);
                     let defaults = NSUserDefaults::standardUserDefaults();
                     defaults.setBool_forKey(!on, &NSString::from_str(FOLLOW_OFF_KEY));
                     let (names, cur) = UI.with_borrow(|u| match u {
@@ -267,11 +262,12 @@ struct Ui {
     cur: usize,
 }
 
+/// Focus follows mouse; read by the input thread on every pointer move.
+static FOLLOW: AtomicBool = AtomicBool::new(true);
+
 thread_local! {
     static CTRL: OnceCell<Retained<Controller>> = const { OnceCell::new() };
     static UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
-    static DRAIN_SCHEDULED: Cell<bool> = const { Cell::new(false) };
-    static FOLLOW: Cell<bool> = const { Cell::new(true) };
     static HOVER_AT: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
 }
 
@@ -315,12 +311,6 @@ fn debounce(sel: Sel, delay: f64) {
     perform(sel, None, delay);
 }
 
-pub fn schedule_drain() {
-    if !DRAIN_SCHEDULED.replace(true) {
-        perform(sel!(drain:), None, 0.0);
-    }
-}
-
 pub fn schedule_save() {
     debounce(sel!(saveState:), 1.0);
 }
@@ -332,7 +322,7 @@ pub fn schedule_trust_poll() {
 /// Next frame of a glide, about 60 times a second.
 /// Focus follows the mouse (on unless turned off in the menu).
 pub fn follow_mouse() -> bool {
-    FOLLOW.get()
+    FOLLOW.load(Ordering::Relaxed)
 }
 
 /// The pointer moved: check what's under it once it has rested 0.15 s.
@@ -410,7 +400,7 @@ fn edit_contexts() {
 pub fn init(mtm: MainThreadMarker) {
     let off =
         NSUserDefaults::standardUserDefaults().boolForKey(&NSString::from_str(FOLLOW_OFF_KEY));
-    FOLLOW.set(!off);
+    FOLLOW.store(!off, Ordering::Relaxed);
     let c = Controller::new(mtm);
     CTRL.with(|cell| {
         let _ = cell.set(c);

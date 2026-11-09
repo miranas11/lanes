@@ -141,8 +141,27 @@ thread_local! {
     static LAST_ROW_SCROLL: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
-/// Creates the event tap. Needs the Accessibility permission.
+/// Creates the event tap on its own thread. Needs the Accessibility permission.
+///
+/// macOS holds every keyboard, scroll and pointer event until the tap's
+/// callback returns, so the tap must never share a thread with window work:
+/// a slow app would otherwise freeze the cursor. The callback only reads a
+/// few atomics and queues commands for the main thread.
 pub fn install() -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("lanes-input".into())
+        .spawn(move || {
+            let ok = install_here();
+            let _ = tx.send(ok);
+            if ok {
+                CFRunLoop::run();
+            }
+        });
+    spawned.is_ok() && rx.recv().unwrap_or(false)
+}
+
+fn install_here() -> bool {
     let mask: u64 = (1 << CGEventType::KeyDown.0)
         | (1 << CGEventType::KeyUp.0)
         | (1 << CGEventType::FlagsChanged.0)
@@ -164,7 +183,7 @@ pub fn install() -> bool {
     let Some(src) = CFMachPort::new_run_loop_source(None, Some(&port), 0) else {
         return false;
     };
-    let Some(rl) = CFRunLoop::main() else {
+    let Some(rl) = CFRunLoop::current() else {
         return false;
     };
     rl.add_source(Some(&src), unsafe { kCFRunLoopCommonModes });

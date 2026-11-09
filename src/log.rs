@@ -1,15 +1,14 @@
 //! A small append-only log at ~/Library/Logs/Lanes.log, so problems can be
 //! diagnosed from what actually happened. Capped at 1 MB.
 
-use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-thread_local! {
-    static FILE: RefCell<Option<File>> = const { RefCell::new(None) };
-}
+/// Shared by every thread (the input thread and the window movers log too).
+static FILE: Mutex<Option<File>> = Mutex::new(None);
 
 pub fn path() -> PathBuf {
     let home = std::env::var_os("HOME")
@@ -30,7 +29,9 @@ pub fn init() {
         let _ = fs::rename(&p, p.with_extension("old.log"));
     }
     let f = OpenOptions::new().create(true).append(true).open(&p).ok();
-    FILE.with_borrow_mut(|slot| *slot = f);
+    if let Ok(mut slot) = FILE.lock() {
+        *slot = f;
+    }
 }
 
 pub fn write(msg: &str) {
@@ -45,11 +46,11 @@ pub fn write(msg: &str) {
         ((secs % 3600.0) / 60.0) as u32,
         secs % 60.0,
     );
-    FILE.with_borrow_mut(|f| {
-        if let Some(f) = f {
-            let _ = writeln!(f, "{h:02}:{m:02}:{s:06.3} {msg}");
-        }
-    });
+    if let Ok(mut f) = FILE.lock()
+        && let Some(f) = f.as_mut()
+    {
+        let _ = writeln!(f, "{h:02}:{m:02}:{s:06.3} {msg}");
+    }
 }
 
 #[macro_export]

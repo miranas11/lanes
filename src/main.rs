@@ -8,6 +8,7 @@ mod ax;
 mod input;
 mod layout;
 mod log;
+mod mover;
 mod spaces;
 mod store;
 mod ui;
