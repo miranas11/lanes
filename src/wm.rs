@@ -2751,9 +2751,10 @@ impl Wm {
             ms: layout::coast_ms(to - from, v, GLIDE_MS),
             settle: true,
         });
+        // The app it's heading for gets focus when the row arrives, not now:
+        // an app that is busy coming forward stops following the row, and a
+        // gap opens next to it until it catches up.
         self.schedule_tick();
-        // The app it's heading for gets focus now, not when it arrives.
-        self.focus_main();
     }
 
     /// Slide the row (never resize) so `tiles[main]` is framed.
