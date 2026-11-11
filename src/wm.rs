@@ -67,6 +67,9 @@ pub enum Cmd {
     OvEnter,
     OvClose,
     OvPick(usize),
+    /// An app's icon was dragged in ⌃⌥P and let go over this context (None:
+    /// over nothing, or its own context).
+    OvDrop(u32, Option<usize>),
     Scroll(f64),
     /// Fingers lifted from a ⌃⌥-scroll at this speed (points a second).
     Fling(f64),
@@ -1663,20 +1666,40 @@ impl Wm {
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let mut pids = Vec::new();
-                let mut count = 0;
-                for id in &c.order {
-                    if let Some(w) = self.wins.get(id).filter(|w| w.present) {
-                        count += 1;
-                        if !pids.contains(&w.pid) {
-                            pids.push(w.pid);
-                        }
-                    }
-                }
+                let present: Vec<&Win> = c
+                    .order
+                    .iter()
+                    .filter_map(|id| self.wins.get(id))
+                    .filter(|w| w.present)
+                    .collect();
+                let wins = present
+                    .iter()
+                    .map(|w| {
+                        let app = self
+                            .apps
+                            .get(&w.pid)
+                            .map(|a| a.name.clone())
+                            .unwrap_or_default();
+                        // Only an app with several windows here needs their
+                        // titles to tell them apart (asking the app is slow).
+                        let twin = present.iter().filter(|o| o.pid == w.pid).count() > 1;
+                        let title = if twin {
+                            ax::names(|n| ax::get_string(&w.el, &n.title)).unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        let what = if title.is_empty() || title == app {
+                            app
+                        } else {
+                            format!("{app} — {title}")
+                        };
+                        (w.id, w.pid, what)
+                    })
+                    .collect();
                 ContextCard {
                     name: c.name.clone(),
-                    count,
-                    pids,
+                    count: present.len(),
+                    wins,
                     current: i == self.cur,
                 }
             })
@@ -1684,6 +1707,88 @@ impl Wm {
         let cols = ui::show_contexts(&cards, sel);
         self.overlay = Overlay::Contexts { sel, cols };
         set_mode(Mode::Overview);
+    }
+
+    /// An icon dragged in ⌃⌥P was let go: over a context, its window moves
+    /// there; anywhere else it goes back to where it was.
+    fn overlay_drop(&mut self, id: u32, to: Option<usize>) {
+        let Overlay::Contexts { sel, .. } = self.overlay else {
+            return;
+        };
+        if let Some(to) = to {
+            self.move_to_context(id, to);
+        }
+        self.show_contexts(sel);
+    }
+
+    /// Window `id` leaves its context and joins the end of `to`'s row.
+    fn move_to_context(&mut self, id: u32, to: usize) {
+        let Some(w) = self.wins.get(&id) else { return };
+        let (from, group) = (w.ctx, w.area.map(|a| a.group));
+        if to >= self.ctxs.len() || to == from {
+            return;
+        }
+        let cur = self.cur;
+        let c = &mut self.ctxs[from];
+        let was_focus = c.focus == Some(id);
+        if let Some(i) = c.order.iter().position(|&x| x == id) {
+            c.order.remove(i);
+            if was_focus {
+                c.focus = c
+                    .order
+                    .get(i)
+                    .or_else(|| i.checked_sub(1).and_then(|j| c.order.get(j)))
+                    .copied();
+            }
+        }
+        // It leaves the screen it shared; one window left there on its own
+        // goes back to being a plain window.
+        if let Some(g) = group {
+            let rest: Vec<u32> = self
+                .wins
+                .values()
+                .filter(|m| m.id != id && m.ctx == from && m.area.is_some_and(|a| a.group == g))
+                .map(|m| m.id)
+                .collect();
+            if let [last] = rest[..]
+                && let Some(m) = self.wins.get_mut(&last)
+            {
+                m.area = None;
+                m.left_area = None;
+            }
+        }
+        if let Some(w) = self.wins.get_mut(&id) {
+            w.ctx = to;
+            w.area = None;
+            w.left_area = None;
+        }
+        let t = &mut self.ctxs[to];
+        t.order.retain(|&x| x != id);
+        t.order.push(id);
+        let was_empty = t.focus.is_none();
+        if was_empty {
+            t.focus = Some(id);
+        }
+        crate::log!(
+            "window {id} ({}) moved from {} to {}",
+            self.app_name_of(id),
+            self.ctxs[from].name,
+            self.ctxs[to].name
+        );
+        self.anim = None;
+        if to == cur && !was_empty && let Some(f) = self.ctxs[cur].focus {
+            self.ensure_visible(f);
+        }
+        self.layout();
+        if from == cur && was_focus {
+            // The window you were in has left: another one takes over.
+            self.quiet_until = Instant::now() + Duration::from_millis(700);
+            self.focus_current_or_self();
+        } else if to == cur && was_empty {
+            self.focus(id);
+        }
+        self.dots_needed = true;
+        self.save_needed = true;
     }
 
     fn overlay_move(&mut self, dx: i32, dy: i32) {
@@ -2498,6 +2603,7 @@ impl Wm {
             Cmd::OvEnter => self.overlay_enter(),
             Cmd::OvCarry(d) => self.overlay_carry(d),
             Cmd::ActivateApp(pid) => activate_app(pid),
+            Cmd::OvDrop(id, to) => self.overlay_drop(id, to),
             Cmd::OvPick(i) => {
                 match &mut self.overlay {
                     Overlay::Apps { sel, .. }

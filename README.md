@@ -39,7 +39,7 @@ Every shortcut is ⌃⌥ (Control + Option) plus one key on the right side of th
 | ⌃⌥1 … ⌃⌥9 | Go to a context |
 | ⌃⌥O | Show all apps in this context |
 | ⇧← / ⇧→ (in ⌃⌥O) | Move the selected app left / right in the row (the order is saved) |
-| ⌃⌥P | Show all contexts |
+| ⌃⌥P | Show all contexts. Drag an app's icon onto another context to move that window there |
 | ⌃⌥↑ / ⌃⌥↓ | Zoom out / in one level |
 | ⌃⌥= / ⌃⌥- | Wider / narrower (⅓ · ½ · ⅔ · full) |
 | ⌃⌥M | Centre the window |
@@ -64,6 +64,8 @@ Quit and reopen Lanes after saving. Which window belongs to which context is rem
 - Use one desktop (Space) per display; Lanes replaces Spaces with contexts.
 - Windows that can't be resized (Calculator, About boxes) sit in the row at their own width.
 - New windows join the context you're in, right after the focused window.
+- To move a window to another context, open ⌃⌥P and drag its icon onto that context. It joins
+  the end of that row. An app with several windows shows one icon per window (hover for its title).
 - Focus follows the pointer (turn it off in the menu). It waits while a menu is open or while
   you're in a dialog Lanes doesn't manage, so pointing elsewhere never closes or buries them.
 - Quitting Lanes (menu, ⌘Q in its menu, logout, or `kill`) brings every hidden window back on screen.

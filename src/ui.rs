@@ -14,7 +14,7 @@ use objc2::{ClassType, MainThreadMarker, MainThreadOnly, define_class, msg_send,
 use objc2_app_kit::{
     NSAnimationContext, NSApplication, NSApplicationDidChangeScreenParametersNotification,
     NSApplicationWillTerminateNotification, NSBackingStoreType, NSButton, NSColor,
-    NSControlStateValueOff, NSControlStateValueOn, NSEventModifierFlags, NSFont, NSFontWeightBold,
+    NSControlStateValueOff, NSControlStateValueOn, NSEvent, NSEventModifierFlags, NSFont, NSFontWeightBold,
     NSFontWeightMedium, NSFontWeightRegular, NSFontWeightSemibold, NSImage, NSImageScaling,
     NSImageSymbolConfiguration, NSImageView, NSLineBreakMode, NSMenu, NSMenuItem, NSPanel,
     NSPopUpMenuWindowLevel, NSRunningApplication, NSScreen, NSStatusBar, NSStatusItem,
@@ -47,9 +47,13 @@ pub struct AppTile {
 pub struct ContextCard {
     pub name: String,
     pub count: usize,
-    pub pids: Vec<i32>,
+    /// Its windows in row order: (window, app, what to call it).
+    pub wins: Vec<(u32, i32, String)>,
     pub current: bool,
 }
+
+/// How many windows a context card shows (two rows of six).
+const CARD_ICONS: usize = 12;
 
 // Menu item tags.
 const TAG_APPS: isize = 20;
@@ -259,6 +263,151 @@ impl Controller {
     }
 }
 
+define_class!(
+    /// Lies over the contexts overview and takes its mouse: a click picks a
+    /// context, dragging an app's icon carries it to another context.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "LanesDragLayer"]
+    struct DragLayer;
+
+    impl DragLayer {
+        /// The panel is never the key window: act on the first click.
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _e: Option<&NSEvent>) -> bool {
+            true
+        }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, e: &NSEvent) {
+            drag_began(e.locationInWindow());
+        }
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, e: &NSEvent) {
+            drag_moved(self, e.locationInWindow());
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, e: &NSEvent) {
+            drag_ended(e.locationInWindow());
+        }
+    }
+);
+
+impl DragLayer {
+    fn new(mtm: MainThreadMarker, frame: CGRect) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+}
+
+/// An app icon in the contexts overview that can be dragged.
+struct DragIcon {
+    card: usize,
+    win: u32,
+    view: Retained<NSImageView>,
+    /// Where it sits, in the panel's coordinates.
+    frame: CGRect,
+}
+
+/// A press in the contexts overview, and the drag it may turn into.
+struct Drag {
+    icon: Option<usize>,
+    tile: Option<usize>,
+    start: CGPoint,
+    moving: bool,
+}
+
+/// Size of an icon while it is being carried.
+const CARRIED: f64 = 44.0;
+
+fn contains(r: CGRect, p: CGPoint, slack: f64) -> bool {
+    p.x >= r.origin.x - slack
+        && p.x <= r.origin.x + r.size.width + slack
+        && p.y >= r.origin.y - slack
+        && p.y <= r.origin.y + r.size.height + slack
+}
+
+fn tile_at(u: &Ui, p: CGPoint) -> Option<usize> {
+    u.tiles.iter().position(|v| contains(v.frame(), p, 0.0))
+}
+
+/// Colour the cards: the selected one, and more strongly the one an app is
+/// being held over.
+fn paint_tiles(u: &Ui, hot: Option<usize>) {
+    let accent = NSColor::controlAccentColor();
+    let on = accent.colorWithAlphaComponent(0.26);
+    let over = accent.colorWithAlphaComponent(0.5);
+    for (i, v) in u.tiles.iter().enumerate() {
+        let c = if hot == Some(i) {
+            Some(&*over)
+        } else if i == u.sel {
+            Some(&*on)
+        } else {
+            None
+        };
+        set_bg(v, c);
+    }
+}
+
+fn drag_began(p: CGPoint) {
+    UI.with_borrow_mut(|u| {
+        let Some(u) = u else { return };
+        u.drag = Some(Drag {
+            icon: u.icons.iter().position(|i| contains(i.frame, p, 3.0)),
+            tile: tile_at(u, p),
+            start: p,
+            moving: false,
+        });
+    });
+}
+
+fn drag_moved(layer: &DragLayer, p: CGPoint) {
+    UI.with_borrow_mut(|u| {
+        let Some(u) = u else { return };
+        let Some(d) = &mut u.drag else { return };
+        let Some(icon) = d.icon.and_then(|i| u.icons.get(i)) else {
+            return;
+        };
+        if !d.moving {
+            if (p.x - d.start.x).hypot(p.y - d.start.y) < 4.0 {
+                return;
+            }
+            // Lift the icon out of its card so it can travel over the others.
+            d.moving = true;
+            icon.view.removeFromSuperview();
+            layer.addSubview(&icon.view);
+        }
+        icon.view.setFrame(rect(
+            p.x - CARRIED / 2.0,
+            p.y - CARRIED / 2.0,
+            CARRIED,
+            CARRIED,
+        ));
+        let from = icon.card;
+        let hot = tile_at(u, p).filter(|&t| t != from);
+        paint_tiles(u, hot);
+    });
+}
+
+fn drag_ended(p: CGPoint) {
+    let cmd = UI.with_borrow_mut(|u| {
+        let u = u.as_mut()?;
+        let d = u.drag.take()?;
+        let at = tile_at(u, p);
+        if !d.moving {
+            // A plain click: pick the card, if the press began on it too.
+            return at.filter(|t| d.tile == Some(*t)).map(Cmd::OvPick);
+        }
+        let icon = u.icons.get(d.icon?)?;
+        Some(Cmd::OvDrop(icon.win, at.filter(|&t| t != icon.card)))
+    });
+    if let Some(c) = cmd {
+        wm::push(c);
+    }
+}
+
 struct Ui {
     mtm: MainThreadMarker,
     item: Retained<NSStatusItem>,
@@ -267,6 +416,11 @@ struct Ui {
     outline: Option<Retained<NSPanel>>,
     overview: Option<Retained<NSPanel>>,
     tiles: Vec<Retained<NSView>>,
+    /// The selected tile of the open overview.
+    sel: usize,
+    /// Draggable icons of the contexts overview, and the drag in progress.
+    icons: Vec<DragIcon>,
+    drag: Option<Drag>,
     dots_key: Option<(usize, Option<usize>)>,
     trusted: bool,
     names: Vec<String>,
@@ -478,6 +632,9 @@ pub fn init(mtm: MainThreadMarker) {
             outline: None,
             overview: None,
             tiles: Vec::new(),
+            sel: 0,
+            icons: Vec::new(),
+            drag: None,
             dots_key: None,
             trusted: true,
             names: Vec::new(),
@@ -1162,6 +1319,8 @@ fn show_overview(
 
         let ctrl = ctrl();
         u.tiles.clear();
+        u.icons.clear();
+        u.drag = None;
         let grid_w = cols as f64 * tile.width + (cols - 1) as f64 * gap;
         let x0 = (width - grid_w) / 2.0;
         for i in 0..count {
@@ -1524,13 +1683,15 @@ pub fn hide_notice() {
     });
 }
 
-/// ⌃⌥P: every context side by side.
+/// ⌃⌥P: every context side by side. Each window is an icon that can be
+/// dragged onto another context.
 pub fn show_contexts(cards: &[ContextCard], sel: usize) -> usize {
     let n = cards.len();
-    show_overview(
+    let icons: RefCell<Vec<(usize, u32, Retained<NSImageView>)>> = RefCell::new(Vec::new());
+    let cols = show_overview(
         "All contexts",
         &format!("{n} contexts"),
-        "← → choose   ↩ switch   ⌃⌥↓ see its apps   esc close",
+        "drag an app to another context   ↩ switch   esc close",
         n,
         4,
         CGSize::new(248.0, 146.0),
@@ -1571,7 +1732,7 @@ pub fn show_contexts(cards: &[ContextCard], sel: usize) -> usize {
             );
             d.setFrame(rect(16.0, 88.0, 216.0, 16.0));
             v.addSubview(&d);
-            if c.pids.is_empty() {
+            if c.wins.is_empty() {
                 let e = label(
                     mtm,
                     "No windows yet",
@@ -1583,14 +1744,54 @@ pub fn show_contexts(cards: &[ContextCard], sel: usize) -> usize {
                 e.setFrame(rect(16.0, 26.0, 216.0, 16.0));
                 v.addSubview(&e);
             }
-            for (k, pid) in c.pids.iter().take(6).enumerate() {
+            // One row of six; a second row above it when there are more.
+            let two_rows = c.wins.len() > 6;
+            for (k, (win, pid, what)) in c.wins.iter().take(CARD_ICONS).enumerate() {
                 let icon = app_icon(mtm, *pid, 32.0);
-                icon.setFrame(rect(14.0 + k as f64 * 37.0, 18.0, 32.0, 32.0));
+                let y = match (two_rows, k < 6) {
+                    (true, true) => 50.0,
+                    (true, false) => 14.0,
+                    _ => 18.0,
+                };
+                icon.setFrame(rect(14.0 + (k % 6) as f64 * 37.0, y, 32.0, 32.0));
+                icon.setToolTip(Some(&NSString::from_str(what)));
                 v.addSubview(&icon);
+                icons.borrow_mut().push((i, *win, icon));
             }
         },
-    )
+    );
+    UI.with_borrow_mut(|u| {
+        let Some(u) = u else { return };
+        let Some(content) = u.overview.as_ref().and_then(|p| p.contentView()) else {
+            return;
+        };
+        let list: Vec<DragIcon> = icons
+            .into_inner()
+            .into_iter()
+            .filter_map(|(card, win, view)| {
+                let t = u.tiles.get(card)?.frame();
+                let f = view.frame();
+                let frame = rect(
+                    t.origin.x + f.origin.x,
+                    t.origin.y + f.origin.y,
+                    f.size.width,
+                    f.size.height,
+                );
+                Some(DragIcon {
+                    card,
+                    win,
+                    view,
+                    frame,
+                })
+            })
+            .collect();
+        u.icons = list;
+        let layer = DragLayer::new(u.mtm, content.bounds());
+        content.addSubview(&layer);
+    });
+    cols
 }
+
 
 /// Is this point (global, top-left origin) inside the open overview?
 pub fn overview_contains(x: f64, y: f64) -> bool {
@@ -1610,12 +1811,10 @@ pub fn overview_contains(x: f64, y: f64) -> bool {
 }
 
 pub fn select_tile(sel: usize) {
-    UI.with_borrow(|u| {
+    UI.with_borrow_mut(|u| {
         let Some(u) = u else { return };
-        let on = NSColor::controlAccentColor().colorWithAlphaComponent(0.26);
-        for (i, v) in u.tiles.iter().enumerate() {
-            set_bg(v, (i == sel).then_some(&*on));
-        }
+        u.sel = sel;
+        paint_tiles(u, None);
     });
 }
 
@@ -1627,5 +1826,7 @@ pub fn hide_overview() {
             p.setContentView(None);
         }
         u.tiles.clear();
+        u.icons.clear();
+        u.drag = None;
     });
 }
